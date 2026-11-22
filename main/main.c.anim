@@ -1,0 +1,242 @@
+/*
+ * ST7789P3 2.25" 76x284 on ESP32-S3 — animated demo
+ *  - plasma background (sin LUT + radial ripple)
+ *  - 4 bouncing shaded balls
+ *  - double-buffered full-frame DMA, FPS in the log
+ */
+#include <math.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_heap_caps.h"
+#include "esp_attr.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+
+static const char *TAG = "anim";
+
+#define PIN_SCK   12
+#define PIN_MOSI  11
+#define PIN_CS    10
+#define PIN_DC     9
+#define PIN_RST    8
+#define PIN_BL     7
+
+#define LCD_W     76
+#define LCD_H    284
+#define GAP_X     82
+#define GAP_Y     18
+#define LCD_HZ   (80 * 1000 * 1000)
+
+#define FB_PIXELS (LCD_W * LCD_H)
+#define NBALLS    4
+
+static esp_lcd_panel_handle_t panel;
+static SemaphoreHandle_t trans_done;
+static uint16_t *fb[2];
+
+static int8_t   sin_lut[256];
+static uint16_t palette[256];
+static uint8_t  dist_lut[FB_PIXELS];
+
+typedef struct { float x, y, vx, vy; int r; uint16_t col, shade; } ball_t;
+static ball_t balls[NBALLS];
+
+/* RGB888 -> RGB565, byte-swapped for SPI */
+static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    uint16_t c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+    return (c >> 8) | (c << 8);
+}
+
+static bool IRAM_ATTR on_trans_done(esp_lcd_panel_io_handle_t io,
+                                    esp_lcd_panel_io_event_data_t *ed, void *ctx)
+{
+    BaseType_t hp = pdFALSE;
+    xSemaphoreGiveFromISR(trans_done, &hp);
+    return hp == pdTRUE;
+}
+
+static void backlight_init(uint8_t duty)
+{
+    ledc_timer_config_t t = {
+        .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_0,
+        .duty_resolution = LEDC_TIMER_8_BIT, .freq_hz = 5000,
+        .clk_cfg = LEDC_AUTO_CLK };
+    ESP_ERROR_CHECK(ledc_timer_config(&t));
+    ledc_channel_config_t c = {
+        .gpio_num = PIN_BL, .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0, .timer_sel = LEDC_TIMER_0, .duty = duty };
+    ESP_ERROR_CHECK(ledc_channel_config(&c));
+}
+
+static void lcd_init(void)
+{
+    spi_bus_config_t bus = {
+        .sclk_io_num = PIN_SCK, .mosi_io_num = PIN_MOSI, .miso_io_num = -1,
+        .quadwp_io_num = -1, .quadhd_io_num = -1,
+        .max_transfer_sz = FB_PIXELS * 2 };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
+
+    esp_lcd_panel_io_handle_t io;
+    esp_lcd_panel_io_spi_config_t io_cfg = {
+        .cs_gpio_num = PIN_CS, .dc_gpio_num = PIN_DC,
+        .spi_mode = 0, .pclk_hz = LCD_HZ,
+        .trans_queue_depth = 10, .lcd_cmd_bits = 8, .lcd_param_bits = 8,
+        .on_color_trans_done = on_trans_done };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_cfg, &io));
+
+    esp_lcd_panel_dev_config_t pcfg = {
+        .reset_gpio_num = PIN_RST,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16 };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io, &pcfg, &panel));
+
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel, true));   /* IPS */
+    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, GAP_X, GAP_Y));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
+}
+
+static void tables_init(void)
+{
+    for (int i = 0; i < 256; i++) {
+        float a = i * 2.0f * (float)M_PI / 256.0f;
+        sin_lut[i] = (int8_t)(127.0f * sinf(a));
+        /* smooth rainbow, slightly dimmed so balls stand out */
+        uint8_t r = (uint8_t)(110 + 100 * sinf(a));
+        uint8_t g = (uint8_t)(110 + 100 * sinf(a + 2.094f));
+        uint8_t b = (uint8_t)(110 + 100 * sinf(a + 4.189f));
+        palette[i] = rgb(r, g, b);
+    }
+    const float cx = LCD_W / 2.0f, cy = LCD_H / 2.0f;
+    for (int y = 0; y < LCD_H; y++)
+        for (int x = 0; x < LCD_W; x++) {
+            float d = sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy));
+            dist_lut[y * LCD_W + x] = (uint8_t)((int)(d * 4.0f) & 0xFF);
+        }
+
+    const struct { uint8_t r, g, b; } cols[NBALLS] = {
+        {255, 60, 60}, {60, 255, 120}, {80, 140, 255}, {255, 220, 40} };
+    for (int i = 0; i < NBALLS; i++) {
+        balls[i] = (ball_t){
+            .x = 15 + i * 15, .y = 30 + i * 60,
+            .vx = (i & 1 ? 1.3f : -1.1f) + i * 0.2f,
+            .vy = (i & 1 ? -2.1f : 2.6f) - i * 0.3f,
+            .r = 8 + (i % 2) * 3,
+            .col = rgb(cols[i].r, cols[i].g, cols[i].b),
+            .shade = rgb(cols[i].r / 3, cols[i].g / 3, cols[i].b / 3) };
+    }
+}
+
+static void render_plasma(uint16_t *dst, uint32_t t)
+{
+    for (int y = 0; y < LCD_H; y++) {
+        int ry = sin_lut[(y * 2 + t) & 0xFF] + sin_lut[(y * 3 - t * 2) & 0xFF];
+        const uint8_t *dl = &dist_lut[y * LCD_W];
+        uint16_t *row = &dst[y * LCD_W];
+        for (int x = 0; x < LCD_W; x++) {
+            int v = ry
+                  + sin_lut[(x * 6 + t * 3) & 0xFF]
+                  + sin_lut[(dl[x] - t * 4) & 0xFF];
+            row[x] = palette[((v >> 2) + t) & 0xFF];
+        }
+    }
+}
+
+static void draw_ball(uint16_t *dst, const ball_t *b)
+{
+    const uint16_t white = 0xFFFF, black = 0x0000;
+    int r = b->r, r2 = r * r, ro2 = (r - 1) * (r - 1);
+    int hr = r / 3, hx = -r / 3, hy = -r / 3;
+    int cx = (int)b->x, cy = (int)b->y;
+    for (int dy = -r; dy <= r; dy++) {
+        int py = cy + dy;
+        if (py < 0 || py >= LCD_H) continue;
+        for (int dx = -r; dx <= r; dx++) {
+            int px = cx + dx;
+            if (px < 0 || px >= LCD_W) continue;
+            int d2 = dx * dx + dy * dy;
+            if (d2 > r2) continue;
+            uint16_t c;
+            if (d2 > ro2)                                         c = black;
+            else if ((dx - hx) * (dx - hx) + (dy - hy) * (dy - hy) <= hr * hr) c = white;
+            else if (dx + dy > r / 2)                             c = b->shade;
+            else                                                  c = b->col;
+            dst[py * LCD_W + px] = c;
+        }
+    }
+}
+
+static void step_balls(void)
+{
+    for (int i = 0; i < NBALLS; i++) {
+        ball_t *b = &balls[i];
+        b->x += b->vx; b->y += b->vy;
+        if (b->x < b->r)              { b->x = b->r;              b->vx = -b->vx; }
+        if (b->x > LCD_W - 1 - b->r)  { b->x = LCD_W - 1 - b->r;  b->vx = -b->vx; }
+        if (b->y < b->r)              { b->y = b->r;              b->vy = -b->vy; }
+        if (b->y > LCD_H - 1 - b->r)  { b->y = LCD_H - 1 - b->r;  b->vy = -b->vy; }
+    }
+}
+
+void app_main(void)
+{
+    trans_done = xSemaphoreCreateBinary();
+    xSemaphoreGive(trans_done);
+
+    for (int i = 0; i < 2; i++) {
+        fb[i] = heap_caps_malloc(FB_PIXELS * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        assert(fb[i]);
+    }
+
+    tables_init();
+    backlight_init(0);
+    lcd_init();
+
+    /* fade-in backlight */
+    for (int d = 0; d <= 220; d += 4) {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, d);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+        if (d == 0) {   /* first frame before the light comes up */
+            render_plasma(fb[0], 0);
+            xSemaphoreTake(trans_done, portMAX_DELAY);
+            esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_W, LCD_H, fb[0]);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    int cur = 1;
+    uint32_t t = 1, frames = 0;
+    int64_t t0 = esp_timer_get_time();
+
+    while (1) {
+        uint16_t *dst = fb[cur];
+        render_plasma(dst, t);
+        step_balls();
+        for (int i = 0; i < NBALLS; i++) draw_ball(dst, &balls[i]);
+
+        xSemaphoreTake(trans_done, portMAX_DELAY);       /* previous frame sent */
+        esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_W, LCD_H, dst);
+
+        cur ^= 1;
+        t++;
+        frames++;
+        vTaskDelay(1);                                   /* feed IDLE / task WDT */
+
+        int64_t now = esp_timer_get_time();
+        if (now - t0 >= 1000000) {
+            ESP_LOGI(TAG, "%lu fps", (unsigned long)frames);
+            frames = 0;
+            t0 = now;
+        }
+    }
+}

@@ -1,0 +1,458 @@
+/*
+ * ST7789P3 2.25" 76x284 on ESP32-S3 — on-board (trip) computer + Mac monitor
+ *  screens: DRIVE (rpm/speed/gauges), TRIP (trip stats), MAC (system monitor)
+ *  host -> board over USB-Serial/JTAG, one ASCII line each:
+ *    "C <speed> <rpm> <coolant C> <fuel %> <volt*10> <L/100km*10>"   car data (CAN gateway)
+ *    "M <cpu%> <ram%> <rx KB/s> <tx KB/s> <bat%>"                    tools/sysmon.py
+ *    "N"                                                             next screen
+ *  without "C" packets the car data is simulated (DEMO). BOOT button (GPIO0) = next screen.
+ */
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "driver/usb_serial_jtag.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_heap_caps.h"
+#include "esp_attr.h"
+#include "esp_log.h"
+
+static const char *TAG = "sysmon";
+
+#define PIN_SCK   12
+#define PIN_MOSI  11
+#define PIN_CS    10
+#define PIN_DC     9
+#define PIN_RST    8
+#define PIN_BL     7
+#define PIN_BTN    0                 /* BOOT button, active low */
+
+#define LCD_W     76
+#define LCD_H    284
+#define GAP_X     82
+#define GAP_Y     18
+#define LCD_HZ   (80 * 1000 * 1000)
+
+#define FB_PIXELS (LCD_W * LCD_H)
+
+#define HIST      72                 /* history samples == graph width in px */
+#define SEC_H     52                 /* MAC section pitch */
+#define GRAPH_H   32
+#define STALE_MS  3000
+#define FRAME_MS  50                 /* 20 fps redraw */
+
+#define RPM_SEGS  15
+#define RPM_MAX   7000
+#define TANK_L    50                 /* fuel tank, litres (for range) */
+
+enum { SCR_DRIVE, SCR_TRIP, SCR_MAC, NSCREEN };
+
+enum { M_CPU, M_RAM, M_RX, M_TX, M_BAT, NMETRIC };
+static const char *const names[NMETRIC] = { "CPU", "RAM", "RX", "TX", "BAT" };
+
+static esp_lcd_panel_handle_t panel;
+static SemaphoreHandle_t trans_done;
+static uint16_t *fb;
+static int32_t hist[NMETRIC][HIST];  /* -1 == no value (battery on a desktop) */
+
+typedef struct { int speed, rpm, cool, fuel, volt10, l100x10; } car_t;
+static car_t car;
+static bool car_live;                /* false -> simulated */
+static int screen;
+static float trip_m, trip_l, sim_t;  /* metres, litres used, sim seconds */
+static uint32_t trip_ms;
+
+/* 5x7 font, one byte per column, bit 0 = top row */
+static const struct { char c; uint8_t col[5]; } font[] = {
+    {'0', {0x3E, 0x51, 0x49, 0x45, 0x3E}}, {'1', {0x00, 0x42, 0x7F, 0x40, 0x00}},
+    {'2', {0x42, 0x61, 0x51, 0x49, 0x46}}, {'3', {0x21, 0x41, 0x45, 0x4B, 0x31}},
+    {'4', {0x18, 0x14, 0x12, 0x7F, 0x10}}, {'5', {0x27, 0x45, 0x45, 0x45, 0x39}},
+    {'6', {0x3C, 0x4A, 0x49, 0x49, 0x30}}, {'7', {0x01, 0x71, 0x09, 0x05, 0x03}},
+    {'8', {0x36, 0x49, 0x49, 0x49, 0x36}}, {'9', {0x06, 0x49, 0x49, 0x29, 0x1E}},
+    {'.', {0x00, 0x60, 0x60, 0x00, 0x00}}, {'%', {0x23, 0x13, 0x08, 0x64, 0x62}},
+    {'-', {0x08, 0x08, 0x08, 0x08, 0x08}}, {'A', {0x7E, 0x11, 0x11, 0x11, 0x7E}},
+    {'B', {0x7F, 0x49, 0x49, 0x49, 0x36}}, {'C', {0x3E, 0x41, 0x41, 0x41, 0x22}},
+    {'D', {0x7F, 0x41, 0x41, 0x22, 0x1C}}, {'K', {0x7F, 0x08, 0x14, 0x22, 0x41}},
+    {'M', {0x7F, 0x02, 0x0C, 0x02, 0x7F}}, {'N', {0x7F, 0x04, 0x08, 0x10, 0x7F}},
+    {'O', {0x3E, 0x41, 0x41, 0x41, 0x3E}}, {'P', {0x7F, 0x09, 0x09, 0x09, 0x06}},
+    {'R', {0x7F, 0x09, 0x19, 0x29, 0x46}}, {'T', {0x01, 0x01, 0x7F, 0x01, 0x01}},
+    {'E', {0x7F, 0x49, 0x49, 0x49, 0x41}}, {'F', {0x7F, 0x09, 0x09, 0x09, 0x01}},
+    {'G', {0x3E, 0x41, 0x49, 0x49, 0x7A}}, {'I', {0x00, 0x41, 0x7F, 0x41, 0x00}},
+    {'L', {0x7F, 0x40, 0x40, 0x40, 0x40}}, {'S', {0x46, 0x49, 0x49, 0x49, 0x31}},
+    {'V', {0x1F, 0x20, 0x40, 0x20, 0x1F}}, {'W', {0x3F, 0x40, 0x38, 0x40, 0x3F}},
+    {'Y', {0x07, 0x08, 0x70, 0x08, 0x07}}, {':', {0x00, 0x36, 0x36, 0x00, 0x00}},
+    {'/', {0x20, 0x10, 0x08, 0x04, 0x02}},
+    {'U', {0x3F, 0x40, 0x40, 0x40, 0x3F}}, {'X', {0x63, 0x14, 0x08, 0x14, 0x63}},
+};
+
+/* RGB888 -> RGB565, byte-swapped for SPI */
+static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    uint16_t c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+    return (c >> 8) | (c << 8);
+}
+
+static bool IRAM_ATTR on_trans_done(esp_lcd_panel_io_handle_t io,
+                                    esp_lcd_panel_io_event_data_t *ed, void *ctx)
+{
+    BaseType_t hp = pdFALSE;
+    xSemaphoreGiveFromISR(trans_done, &hp);
+    return hp == pdTRUE;
+}
+
+static void backlight_init(uint8_t duty)
+{
+    ledc_timer_config_t t = {
+        .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_0,
+        .duty_resolution = LEDC_TIMER_8_BIT, .freq_hz = 5000,
+        .clk_cfg = LEDC_AUTO_CLK };
+    ESP_ERROR_CHECK(ledc_timer_config(&t));
+    ledc_channel_config_t c = {
+        .gpio_num = PIN_BL, .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0, .timer_sel = LEDC_TIMER_0, .duty = duty };
+    ESP_ERROR_CHECK(ledc_channel_config(&c));
+}
+
+static void lcd_init(void)
+{
+    spi_bus_config_t bus = {
+        .sclk_io_num = PIN_SCK, .mosi_io_num = PIN_MOSI, .miso_io_num = -1,
+        .quadwp_io_num = -1, .quadhd_io_num = -1,
+        .max_transfer_sz = FB_PIXELS * 2 };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
+
+    esp_lcd_panel_io_handle_t io;
+    esp_lcd_panel_io_spi_config_t io_cfg = {
+        .cs_gpio_num = PIN_CS, .dc_gpio_num = PIN_DC,
+        .spi_mode = 0, .pclk_hz = LCD_HZ,
+        .trans_queue_depth = 10, .lcd_cmd_bits = 8, .lcd_param_bits = 8,
+        .on_color_trans_done = on_trans_done };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_cfg, &io));
+
+    esp_lcd_panel_dev_config_t pcfg = {
+        .reset_gpio_num = PIN_RST,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16 };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io, &pcfg, &panel));
+
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel, true));   /* IPS */
+    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, GAP_X, GAP_Y));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
+}
+
+static void fill_rect(int x, int y, int w, int h, uint16_t c)
+{
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > LCD_W) w = LCD_W - x;
+    if (y + h > LCD_H) h = LCD_H - y;
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++)
+            fb[(y + j) * LCD_W + x + i] = c;
+}
+
+static int text_w(const char *s, int scale)
+{
+    return (int)strlen(s) * 6 * scale - scale;
+}
+
+static void draw_text(int x, int y, int scale, uint16_t color, const char *s)
+{
+    for (; *s; s++, x += 6 * scale) {
+        const uint8_t *g = NULL;
+        for (size_t i = 0; i < sizeof(font) / sizeof(font[0]); i++)
+            if (font[i].c == *s) { g = font[i].col; break; }
+        if (!g) continue;
+        for (int cx = 0; cx < 5; cx++)
+            for (int cy = 0; cy < 7; cy++)
+                if (g[cx] & (1 << cy))
+                    fill_rect(x + cx * scale, y + cy * scale, scale, scale, color);
+    }
+}
+
+static void push_sample(int m, int32_t v)
+{
+    memmove(hist[m], hist[m] + 1, (HIST - 1) * sizeof(hist[m][0]));
+    hist[m][HIST - 1] = v;
+}
+
+#define GRAY   rgb(150, 150, 150)
+#define WHITE  rgb(255, 255, 255)
+#define DIM    rgb(28, 28, 40)
+#define GREEN  rgb(80, 220, 120)
+#define YELLOW rgb(255, 210, 50)
+#define RED    rgb(255, 60, 60)
+#define BLUE   rgb(70, 150, 255)
+
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+static void draw_centered(int y, int scale, uint16_t col, const char *s)
+{
+    draw_text((LCD_W - text_w(s, scale)) / 2, y, scale, col, s);
+}
+
+/* horizontal bar, fill in permille */
+static void draw_bar(int x, int y, int w, int h, int permille, uint16_t col)
+{
+    fill_rect(x, y, w, h, DIM);
+    fill_rect(x, y, w * clampi(permille, 0, 1000) / 1000, h, col);
+}
+
+/* label (small, left) + value (x2, right) + optional bar below */
+static void draw_gauge(int y, const char *label, const char *val, int permille, uint16_t col)
+{
+    draw_text(2, y + 4, 1, GRAY, label);
+    draw_text(LCD_W - 2 - text_w(val, 2), y, 2, WHITE, val);
+    if (permille >= 0) draw_bar(2, y + 18, 72, 8, permille, col);
+}
+
+static void draw_page_dots(void)
+{
+    const int x0 = (LCD_W - (NSCREEN * 8 - 4)) / 2;
+    for (int i = 0; i < NSCREEN; i++)
+        fill_rect(x0 + i * 8, 277, 4, 4, i == screen ? WHITE : DIM);
+}
+
+static void draw_drive(void)
+{
+    char b[24];
+
+    int lit = clampi(car.rpm * RPM_SEGS / RPM_MAX, 0, RPM_SEGS);
+    for (int i = 0; i < RPM_SEGS; i++) {
+        uint16_t c = i >= lit ? DIM : i >= RPM_SEGS - 3 ? RED : i >= RPM_SEGS - 6 ? YELLOW : GREEN;
+        fill_rect(1 + i * 5, 2, 4, 12, c);
+    }
+    snprintf(b, sizeof(b), "%d", car.rpm);
+    draw_text(2, 18, 1, GRAY, "RPM");
+    draw_text(LCD_W - 2 - text_w(b, 1), 18, 1, WHITE, b);
+
+    snprintf(b, sizeof(b), "%d", car.speed);
+    draw_centered(34, 4, WHITE, b);
+    draw_centered(66, 1, GRAY, "KM/H");
+    fill_rect(2, 80, 72, 1, DIM);
+
+    snprintf(b, sizeof(b), "%dC", car.cool);
+    draw_gauge(86, "COOL", b, (car.cool - 40) * 1000 / 80,
+               car.cool < 70 ? BLUE : car.cool > 105 ? RED : GREEN);
+    snprintf(b, sizeof(b), "%d%%", car.fuel);
+    draw_gauge(128, "FUEL", b, car.fuel * 10, car.fuel < 15 ? RED : GREEN);
+    snprintf(b, sizeof(b), "%d.%dV", car.volt10 / 10, car.volt10 % 10);
+    draw_gauge(170, "VOLT", b, (car.volt10 - 100) * 1000 / 60,
+               car.volt10 < 118 || car.volt10 > 150 ? RED : GREEN);
+    snprintf(b, sizeof(b), "%d.%d", car.l100x10 / 10, car.l100x10 % 10);
+    draw_gauge(212, "L/100", b, car.l100x10 * 1000 / 200, YELLOW);
+
+    float l100 = car.l100x10 / 10.0f;
+    snprintf(b, sizeof(b), "%dKM", l100 > 0.5f ? (int)(car.fuel * TANK_L / 100.0f / l100 * 100.0f) : 0);
+    draw_gauge(246, "RANGE", b, -1, WHITE);
+
+    if (!car_live) draw_centered(266, 1, RED, "DEMO");
+}
+
+static void draw_trip(void)
+{
+    char v[24];
+    const float km = trip_m / 1000.0f;
+    const float hours = trip_ms / 3.6e6f;
+    const int avg_kmh = hours > 0.0005f ? (int)(km / hours) : 0;
+    const int avg_l100x10 = km > 0.05f ? (int)(trip_l / km * 1000.0f) : car.l100x10;
+    const int secs = (int)(trip_ms / 1000);
+
+    const char *label[5] = { "TRIP KM", "TIME", "AVG KM/H", "AVG L/100", "RANGE KM" };
+    snprintf(v, sizeof(v), "%d.%d", (int)km, (int)(km * 10) % 10);
+    char vals[5][24];
+    strcpy(vals[0], v);
+    snprintf(vals[1], sizeof(vals[1]), "%d:%02d", secs / 3600, secs / 60 % 60);
+    snprintf(vals[2], sizeof(vals[2]), "%d", avg_kmh);
+    snprintf(vals[3], sizeof(vals[3]), "%d.%d", avg_l100x10 / 10, avg_l100x10 % 10);
+    float l100 = avg_l100x10 / 10.0f;
+    snprintf(vals[4], sizeof(vals[4]), "%d", l100 > 0.5f ? (int)(car.fuel * TANK_L / 100.0f / l100 * 100.0f) : 0);
+
+    for (int i = 0; i < 5; i++) {
+        const int y = 4 + i * 52;
+        const int scale = text_w(vals[i], 3) <= 72 ? 3 : 2;
+        draw_text(2, y, 1, GRAY, label[i]);
+        draw_text(2, y + 10, scale, WHITE, vals[i]);
+        fill_rect(2, y + 38, 72, 1, DIM);
+    }
+    if (!car_live) draw_centered(266, 1, RED, "DEMO");
+}
+
+static void draw_mac(bool stale)
+{
+    for (int m = 0; m < NMETRIC; m++) {
+        const int y0 = 2 + m * SEC_H;
+        const bool net = (m == M_RX || m == M_TX);
+        const int32_t cur = hist[m][HIST - 1];
+        char buf[24];
+        uint16_t col;
+
+        int32_t full = 100;                       /* percent metrics; net autoscales */
+        if (net) {
+            full = 100;                           /* KB/s floor so idle noise stays flat */
+            for (int i = 0; i < HIST; i++)
+                if (hist[m][i] > full) full = hist[m][i];
+        }
+
+        if (cur < 0)           snprintf(buf, sizeof(buf), "--");
+        else if (!net)         snprintf(buf, sizeof(buf), "%d%%", (int)cur);
+        else if (cur < 1000)   snprintf(buf, sizeof(buf), "%dK", (int)cur);
+        else                   snprintf(buf, sizeof(buf), "%d.%dM", (int)(cur / 1024), (int)(cur * 10 / 1024 % 10));
+
+        if (m == M_RX)         col = rgb(60, 200, 255);
+        else if (m == M_TX)    col = rgb(255, 90, 220);
+        else if (m == M_BAT)   col = cur >= 0 && cur < 20 ? RED : GREEN;
+        else                   col = cur < 60 ? GREEN : cur < 85 ? YELLOW : RED;
+
+        draw_text(2, y0 + 4, 1, GRAY, names[m]);
+        draw_text(LCD_W - 2 - text_w(buf, 2), y0, 2, WHITE, buf);
+
+        const int gy = y0 + 16;
+        fill_rect(2, gy, HIST, GRAPH_H, rgb(20, 20, 32));
+        for (int i = 0; i < HIST; i++) {
+            int32_t v = hist[m][i];
+            if (v <= 0) continue;
+            int h = (int)((int64_t)v * GRAPH_H / full);
+            if (h < 1) h = 1;
+            if (h > GRAPH_H) h = GRAPH_H;
+            fill_rect(2 + i, gy + GRAPH_H - h, 1, h, col);
+        }
+    }
+    if (stale) draw_centered(266, 1, RED, "NO DATA");
+}
+
+/* wait for the previous frame, draw the current screen, send */
+static void render(bool mac_stale)
+{
+    xSemaphoreTake(trans_done, portMAX_DELAY);
+    memset(fb, 0, FB_PIXELS * 2);
+
+    if (screen == SCR_DRIVE)      draw_drive();
+    else if (screen == SCR_TRIP)  draw_trip();
+    else                          draw_mac(mac_stale);
+    draw_page_dots();
+
+    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_W, LCD_H, fb));
+}
+
+/* demo car while no "C" packets arrive */
+static void sim_car(float dt)
+{
+    sim_t += dt;
+    car.speed  = clampi((int)(70 + 55 * sinf(sim_t * 0.15f)), 0, 200);
+    car.rpm    = clampi(800 + car.speed * 28 + (int)(300 * sinf(sim_t * 1.3f)), 700, RPM_MAX);
+    car.cool   = clampi(40 + (int)(sim_t * 1.5f), 40, 90);
+    car.fuel   = clampi(78 - (int)(sim_t * 0.05f), 5, 100);
+    car.volt10 = 141 + (int)(3 * sinf(sim_t * 0.7f));
+    car.l100x10 = clampi((int)(65 + 30 * sinf(sim_t * 0.3f)), 5, 200);
+}
+
+static void car_step(uint32_t dt_ms)
+{
+    if (!car_live) sim_car(dt_ms / 1000.0f);
+    const float dt_h = dt_ms / 3.6e6f;
+    trip_ms += dt_ms;
+    trip_m  += car.speed * dt_h * 1000.0f;
+    trip_l  += car.speed * dt_h * car.l100x10 / 1000.0f;
+}
+
+/* one host line; returns true if it was a car ("C") or monitor ("M") packet */
+static bool parse_line(const char *line)
+{
+    int a, b, c, d, e, f;
+    if (sscanf(line, "C %d %d %d %d %d %d", &a, &b, &c, &d, &e, &f) == 6) {
+        car = (car_t){ a, b, c, d, e, f };
+        return car_live = true;
+    }
+    if (sscanf(line, "M %d %d %d %d %d", &a, &b, &c, &d, &e) == 5) {
+        push_sample(M_CPU, a);
+        push_sample(M_RAM, b);
+        push_sample(M_RX, c);
+        push_sample(M_TX, d);
+        push_sample(M_BAT, e);
+        return true;
+    }
+    if (line[0] == 'N') {
+        screen = (screen + 1) % NSCREEN;
+        return true;
+    }
+    return false;
+}
+
+void app_main(void)
+{
+    trans_done = xSemaphoreCreateBinary();
+    xSemaphoreGive(trans_done);
+
+    fb = heap_caps_malloc(FB_PIXELS * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    assert(fb);
+    for (int m = 0; m < NMETRIC; m++)
+        for (int i = 0; i < HIST; i++) hist[m][i] = (m == M_BAT) ? -1 : 0;
+    car = (car_t){ 0, 800, 40, 78, 141, 65 };
+
+    gpio_config_t btn = { .pin_bit_mask = 1ULL << PIN_BTN, .mode = GPIO_MODE_INPUT,
+                          .pull_up_en = GPIO_PULLUP_ENABLE };
+    ESP_ERROR_CHECK(gpio_config(&btn));
+
+    usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_cfg));
+
+    backlight_init(0);
+    lcd_init();
+
+    render(true);                                        /* first frame before the light comes up */
+    for (int d = 0; d <= 220; d += 4) {                  /* fade-in backlight */
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, d);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_LOGI(TAG, "ready; screens: DRIVE/TRIP/MAC, BOOT button or 'N' = next");
+
+    char line[48];
+    int n = 0;
+    bool have_mac = false, btn_prev = false;
+    TickType_t last_mac = 0, last_car = 0, last_frame = xTaskGetTickCount();
+
+    while (1) {
+        uint8_t rx[32];
+        int got = usb_serial_jtag_read_bytes(rx, sizeof(rx), pdMS_TO_TICKS(20));
+        TickType_t now = xTaskGetTickCount();
+
+        for (int i = 0; i < got; i++) {
+            char c = (char)rx[i];
+            if (c == '\n') {
+                line[n] = 0;
+                if (parse_line(line)) {
+                    if (line[0] == 'M') { have_mac = true; last_mac = now; }
+                    if (line[0] == 'C') last_car = now;
+                }
+                n = 0;
+            } else if (c != '\r' && n < (int)sizeof(line) - 1) {
+                line[n++] = c;
+            }
+        }
+
+        bool pressed = gpio_get_level(PIN_BTN) == 0;
+        if (pressed && !btn_prev) screen = (screen + 1) % NSCREEN;
+        btn_prev = pressed;
+
+        if (car_live && (now - last_car) > pdMS_TO_TICKS(STALE_MS)) car_live = false;
+
+        uint32_t dt = pdTICKS_TO_MS(now - last_frame);
+        if (dt >= FRAME_MS) {
+            last_frame = now;
+            car_step(dt);
+            bool mac_stale = !have_mac || (now - last_mac) > pdMS_TO_TICKS(STALE_MS);
+            render(mac_stale);
+        }
+    }
+}
