@@ -1,6 +1,6 @@
 /*
  * ST7789P3 2.25" 76x284 on ESP32-S3 — Ford Fiesta MK5 on-board computer, landscape 284x76
- *  data: MS-CAN (125 kbit/s) via the on-chip TWAI controller in listen-only mode (never transmits),
+ *  data: MS-CAN (125 kbit/s) via the on-chip TWAI controller in listen-only mode (transmits only for a manual 'G' GEM read),
  *        IDs/bytes from github.com/roncapat/Ford-Fiesta-MK5-MS-CAN-bus; shows NO CAN without frames
  *  screens: DRIVE (rpm/speed/gauges/indicators), TRIP (6 trip stats), FUEL (fuel + volt); BOOT button (GPIO0), encoder (HW-040) or "N" over USB = next
  */
@@ -857,6 +857,12 @@ static void hs_task(void *arg)
     }
 }
 
+#define GEM_TX_ID 0x726              /* GEM (body module) diagnostic request, reply on +8 */
+#define GEM_RX_ID 0x72E
+typedef struct { uint8_t d[8]; } gem_frame_t;
+static QueueHandle_t gem_q;          /* GEM replies from the rx ISR to gem_task */
+static twai_node_handle_t ms_node;
+
 static bool IRAM_ATTR on_can_rx(twai_node_handle_t node, const twai_rx_done_event_data_t *ed, void *ctx)
 {
     uint8_t d[8];
@@ -866,25 +872,146 @@ static bool IRAM_ATTR on_can_rx(twai_node_handle_t node, const twai_rx_done_even
         int len = f.header.dlc > 8 ? 8 : f.header.dlc;
         can_decode(f.header.id, d, len);
         if (len) dump_push_isr('M', f.header.id, d, len);
+        if (f.header.id == GEM_RX_ID && gem_q && len == 8) {
+            gem_frame_t g;
+            memcpy(g.d, d, 8);
+            BaseType_t woken = pdFALSE;
+            xQueueSendFromISR(gem_q, &g, &woken);
+            return woken == pdTRUE;
+        }
     }
     return false;
 }
 
-/* listen-only: no TX, no ACK — cannot disturb the car's bus */
-static void can_init(void)
+/* listen-only (default): no TX, no ACK — cannot disturb the car's bus.
+ * Normal mode only for the duration of a manual 'G' (GEM read), see gem_task() */
+static bool can_open(bool listen_only)
 {
     twai_onchip_node_config_t cfg = {
         .io_cfg = { .tx = PIN_CAN_TX, .rx = PIN_CAN_RX, .quanta_clk_out = -1, .bus_off_indicator = -1 },
         .bit_timing = { .bitrate = 125000 },
-        .fail_retry_cnt = 0,
-        .tx_queue_depth = 1,
-        .flags = { .enable_listen_only = 1 } };
-    twai_node_handle_t node;
+        .fail_retry_cnt = listen_only ? 0 : 3,
+        .tx_queue_depth = 2,
+        .flags = { .enable_listen_only = listen_only } };
     twai_event_callbacks_t cbs = { .on_rx_done = on_can_rx };
-    if (twai_new_node_onchip(&cfg, &node) != ESP_OK ||
-        twai_node_register_event_callbacks(node, &cbs, NULL) != ESP_OK ||
-        twai_node_enable(node) != ESP_OK)
+    if (twai_new_node_onchip(&cfg, &ms_node) != ESP_OK ||
+        twai_node_register_event_callbacks(ms_node, &cbs, NULL) != ESP_OK ||
+        twai_node_enable(ms_node) != ESP_OK) {
         ESP_LOGW(TAG, "TWAI init failed, no MS-CAN data");
+        return false;
+    }
+    return true;
+}
+
+static void can_init(void)
+{
+    can_open(true);
+}
+
+/* GEM As-Built READ ONLY (ISO 15765-2 / KWP2000, protocol notes in docs/): 10 87, then 21 01/02/03 on 0x726.
+ * Never sends 3B (write), 11 (reset) or anything else. Started by 'G' over USB; refused unless the car is
+ * standing with the handbrake on. The raw replies are logged and the first successful read is kept in NVS as a backup. */
+static volatile bool gem_busy;
+
+static bool gem_send(const uint8_t *d, int len)
+{
+    uint8_t b[8] = { 0 };
+    memcpy(b, d, len);
+    twai_frame_t f = { .header = { .id = GEM_TX_ID, .dlc = 8 }, .buffer = b, .buffer_len = 8 };
+    return twai_node_transmit(ms_node, &f, 100) == ESP_OK && twai_node_transmit_wait_all_done(ms_node, 300) == ESP_OK;
+}
+
+/* one request, one (possibly multi-frame) answer; returns its length or -1 */
+static int gem_request(const uint8_t *req, int rlen, uint8_t *out, int cap)
+{
+    uint8_t sf[8] = { (uint8_t)rlen };
+    memcpy(sf + 1, req, rlen);
+    xQueueReset(gem_q);
+    if (!gem_send(sf, 1 + rlen)) return -1;
+
+    int total = 0, have = 0, next_sn = 1;
+    TickType_t end = xTaskGetTickCount() + pdMS_TO_TICKS(3000);
+    gem_frame_t g;
+    while (xTaskGetTickCount() < end) {
+        if (xQueueReceive(gem_q, &g, pdMS_TO_TICKS(500)) != pdTRUE) continue;
+        const int pci = g.d[0] >> 4;
+        if (pci == 0 && total == 0) {                         /* single frame */
+            const int n = g.d[0] & 0x0F;
+            if (n >= 3 && g.d[1] == 0x7F && g.d[3] == 0x78) { end = xTaskGetTickCount() + pdMS_TO_TICKS(3000); continue; }   /* responsePending */
+            if (n > cap || n > 7) return -1;
+            memcpy(out, g.d + 1, n);
+            return n;
+        } else if (pci == 1 && total == 0) {                  /* first frame: ask for the rest */
+            total = (g.d[0] & 0x0F) << 8 | g.d[1];
+            if (total > cap) return -1;
+            have = total < 6 ? total : 6;
+            memcpy(out, g.d + 2, have);
+            const uint8_t fc[3] = { 0x30, 0x00, 0x00 };
+            if (!gem_send(fc, 3)) return -1;
+        } else if (pci == 2 && total) {                       /* consecutive frame */
+            if ((g.d[0] & 0x0F) != (next_sn & 0x0F)) return -1;
+            next_sn++;
+            const int n = total - have < 7 ? total - have : 7;
+            memcpy(out + have, g.d + 1, n);
+            have += n;
+            if (have >= total) return total;
+        }
+    }
+    return -1;
+}
+
+static void gem_hex(char *dst, size_t cap, const uint8_t *d, int n)
+{
+    dst[0] = 0;
+    for (int i = 0; i < n && strlen(dst) + 4 < cap; i++) snprintf(dst + strlen(dst), cap - strlen(dst), "%02X ", d[i]);
+}
+
+static void gem_task(void *arg)
+{
+    if (!car_live || car.speed != 0 || !(car.lights & LIGHT_PB)) {
+        ESP_LOGW(TAG, "GEM read refused: need live CAN, speed 0 and the handbrake on");
+        gem_busy = false;
+        vTaskDelete(NULL);
+    }
+    ESP_LOGW(TAG, "GEM read: MS-CAN switches to normal mode and TRANSMITS read-only requests to 0x%X", GEM_TX_ID);
+    twai_node_disable(ms_node);
+    twai_node_delete(ms_node);
+    bool ok = can_open(false);
+
+    uint8_t r[24];
+    char hx[96];
+    if (ok) {
+        const uint8_t start[2] = { 0x10, 0x87 };
+        int n = gem_request(start, 2, r, sizeof(r));
+        gem_hex(hx, sizeof(hx), r, n > 0 ? n : 0);
+        ESP_LOGI(TAG, "GEM 10 87 -> %s", n > 0 ? hx : "no answer");
+        ok = n >= 2 && r[0] == 0x50;
+    }
+    for (int lid = 1; ok && lid <= 3; lid++) {
+        const uint8_t rq[2] = { 0x21, (uint8_t)lid };
+        int n = gem_request(rq, 2, r, sizeof(r));
+        gem_hex(hx, sizeof(hx), r, n > 0 ? n : 0);
+        ESP_LOGI(TAG, "GEM 21 %02X -> %s", lid, n > 0 ? hx : "no answer");
+        if (n < 2 || r[0] != 0x61 || r[1] != lid) { ok = false; break; }
+        char key[8];
+        snprintf(key, sizeof(key), "gem%d", lid);
+        nvs_handle_t h;
+        size_t sz = 0;
+        if (nvs_open("obc", NVS_READWRITE, &h) == ESP_OK) {
+            if (nvs_get_blob(h, key, NULL, &sz) != ESP_OK) {   /* keep the FIRST read as the backup */
+                nvs_set_blob(h, key, r, n);
+                nvs_commit(h);
+                ESP_LOGI(TAG, "GEM LID %02X saved to NVS as backup (obc/%s)", lid, key);
+            }
+            nvs_close(h);
+        }
+    }
+    twai_node_disable(ms_node);
+    twai_node_delete(ms_node);
+    can_open(true);
+    ESP_LOGW(TAG, "GEM read %s; MS-CAN back to listen-only", ok ? "done" : "FAILED");
+    gem_busy = false;
+    vTaskDelete(NULL);
 }
 
 /* HW-040 quadrature decoder: both edges of CLK/DT, see ENC_TRANS */
@@ -934,6 +1061,7 @@ void app_main(void)
     lcd_init();
     dump_q = xQueueCreate(128, sizeof(dump_msg_t));
     xTaskCreate(dump_task, "dump", 3072, NULL, 3, NULL);
+    gem_q = xQueueCreate(8, sizeof(gem_frame_t));
     can_init();
     xTaskCreate(hs_task, "hs_can", 4096, NULL, 4, NULL);
 
@@ -967,6 +1095,7 @@ void app_main(void)
                 else if (line[0] == 'S') cruise_toggle();
                 else if (line[0] == '+') cruise_adjust(cc_step);
                 else if (line[0] == '-') cruise_adjust(-cc_step);
+                else if (line[0] == 'G' && !gem_busy) { gem_busy = true; xTaskCreate(gem_task, "gem", 4096, NULL, 4, NULL); }
                 else if (line[0] == 'D') {
                     dump_on = !dump_on;
                     ESP_LOGI(TAG, "dump %s", dump_on ? "ON (M=MS-CAN, H=HS-CAN, changes only)" : "OFF");
