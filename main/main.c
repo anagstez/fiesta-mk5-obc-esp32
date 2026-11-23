@@ -968,13 +968,14 @@ static void gem_hex(char *dst, size_t cap, const uint8_t *d, int n)
 
 static void gem_task(void *arg)
 {
-    const bool write = (bool)(intptr_t)arg;     /* 'W': enable lock-at-movement, otherwise read only */
+    const int mode = (int)(intptr_t)arg;        /* 0 'G' read only, 1 'W' enable lock-at-movement, 2 'E' ECUReset of the GEM */
+    const bool write = mode == 1, reset = mode == 2;
     if (!car_live || car.speed != 0 || !(car.lights & LIGHT_PB)) {
         ESP_LOGW(TAG, "GEM read refused: need live CAN, speed 0 and the handbrake on");
         gem_busy = false;
         vTaskDelete(NULL);
     }
-    ESP_LOGW(TAG, "GEM %s: MS-CAN switches to normal mode and TRANSMITS to 0x%X", write ? "WRITE" : "read", GEM_TX_ID);
+    ESP_LOGW(TAG, "GEM %s: MS-CAN switches to normal mode and TRANSMITS to 0x%X", write ? "WRITE" : reset ? "RESET" : "read", GEM_TX_ID);
     twai_node_disable(ms_node);
     twai_node_delete(ms_node);
     bool ok = can_open(false);
@@ -1029,7 +1030,24 @@ static void gem_task(void *arg)
             }
         }
     }
-    for (int lid = 1; ok && !write && lid <= 3; lid++) {
+    if (reset && ok) {
+        /* 11 01 = ECUReset, so the module re-reads its As-Built; it reboots in a few seconds */
+        const uint8_t rst[2] = { 0x11, 0x01 };
+        int n = gem_request(rst, 2, r, sizeof(r));
+        gem_hex(hx, sizeof(hx), r, n > 0 ? n : 0);
+        ESP_LOGW(TAG, "GEM 11 01 -> %s", n > 0 ? hx : "no answer");
+        ok = n >= 2 && r[0] == 0x51;
+        vTaskDelay(pdMS_TO_TICKS(4000));
+        if (ok) {
+            const uint8_t st[2] = { 0x10, 0x87 }, rq[2] = { 0x21, 0x02 };
+            gem_request(st, 2, r, sizeof(r));
+            n = gem_request(rq, 2, r, sizeof(r));
+            gem_hex(hx, sizeof(hx), r, n > 0 ? n : 0);
+            ESP_LOGI(TAG, "GEM after reset 21 02 -> %s", n > 0 ? hx : "no answer");
+            ok = n == 7 && r[0] == 0x61;
+        }
+    }
+    for (int lid = 1; ok && mode == 0 && lid <= 3; lid++) {
         const uint8_t rq[2] = { 0x21, (uint8_t)lid };
         int n = gem_request(rq, 2, r, sizeof(r));
         gem_hex(hx, sizeof(hx), r, n > 0 ? n : 0);
@@ -1137,7 +1155,7 @@ void app_main(void)
                 else if (line[0] == 'S') cruise_toggle();
                 else if (line[0] == '+') cruise_adjust(cc_step);
                 else if (line[0] == '-') cruise_adjust(-cc_step);
-                else if ((line[0] == 'G' || line[0] == 'W') && !gem_busy) { gem_busy = true; xTaskCreate(gem_task, "gem", 5120, (void *)(intptr_t)(line[0] == 'W'), 4, NULL); }
+                else if ((line[0] == 'G' || line[0] == 'W' || line[0] == 'E') && !gem_busy) { gem_busy = true; xTaskCreate(gem_task, "gem", 5120, (void *)(intptr_t)(line[0] == 'W' ? 1 : line[0] == 'E' ? 2 : 0), 4, NULL); }
                 else if (line[0] == 'D') {
                     dump_on = !dump_on;
                     ESP_LOGI(TAG, "dump %s", dump_on ? "ON (M=MS-CAN, H=HS-CAN, changes only)" : "OFF");
