@@ -7,6 +7,10 @@
  *               menu EXIT work with it).
  *  - A SK_GRID screen is cols x rows cells (cols * rows <= 6) filled from item[] left to right, top to bottom.
  *    max_scale = biggest font scale (1..4, 0 = 3); a value that does not fit its cell is shrunk automatically.
+ *  - A SK_GRAPH screen plots ONE parameter (item[0]) over time: a scrolling line over the last span_s seconds
+ *    (0 = 60), the current value on the left, min/max of the window at the right, warn/alarm limits as dashed
+ *    lines, the line itself coloured by level. It records only while the board is powered; an OBD parameter
+ *    is recorded only while that screen is shown (gaps otherwise).
  *  - PARAMS[]   per parameter: the label printed above the value (incl. unit) and warning thresholds.
  *    Thresholds are in the parameter's own raw unit (see the comment on each enum value); the value turns
  *    AMBER outside warn_lo..warn_hi and RED outside alarm_lo..alarm_hi. NO_LO / NO_HI switch a limit off.
@@ -90,20 +94,23 @@ static const param_cfg_t PARAMS[NPARAM] = {
     [P_DTC]       = { "DTC",       NO_LO, NO_HI, NO_LO, 0     },   /* red as soon as one code is stored */
 };
 
-enum { SK_DRIVE, SK_GRID };
+enum { SK_DRIVE, SK_GRID, SK_GRAPH };
 
 typedef struct {
     const char *name;           /* for the log only */
     uint8_t kind;               /* SK_DRIVE (fixed gauge layout) or SK_GRID */
     uint8_t cols, rows;         /* SK_GRID: 1..3 x 1..2 and so on, cols * rows <= 6 */
     uint8_t max_scale;          /* SK_GRID: biggest font scale, 0 = 3 */
-    uint8_t item[6];            /* SK_GRID: P_* per cell */
+    uint8_t item[6];            /* SK_GRID: P_* per cell; SK_GRAPH: item[0] is the plotted parameter */
+    uint16_t span_s;            /* SK_GRAPH: time window in seconds, 0 = 60 */
 } screen_cfg_t;
 
 static const screen_cfg_t SCREENS[] = {
-    { "DRIVE", SK_DRIVE, 0, 0, 0, { 0 } },
-    { "TRIP",  SK_GRID, 3, 2, 3, { P_TRIP_KM, P_TRIP_TIME, P_AVG, P_MAX_SPEED, P_MAX_RPM, P_CLOCK } },
-    { "FUEL",  SK_GRID, 3, 1, 4, { P_FUEL_L, P_L100, P_LEFT_L } },
-    { "ENG",   SK_GRID, 3, 2, 3, { P_MAP, P_IAT, P_TIMING, P_STFT, P_LTFT, P_O2A } },
-    { "ENG 2", SK_GRID, 3, 2, 3, { P_LOAD, P_ECT, P_THR, P_O2B, P_FSYS, P_DTC } },
+    { "DRIVE", SK_DRIVE, 0, 0, 0, { 0 }, 0 },
+    { "TRIP",  SK_GRID, 3, 2, 3, { P_TRIP_KM, P_TRIP_TIME, P_AVG, P_MAX_SPEED, P_MAX_RPM, P_CLOCK }, 0 },
+    { "FUEL",  SK_GRID, 3, 1, 4, { P_FUEL_L, P_L100, P_LEFT_L }, 0 },
+    { "ENG",   SK_GRID, 3, 2, 3, { P_MAP, P_IAT, P_TIMING, P_STFT, P_LTFT, P_O2A }, 0 },
+    { "G SPEED", SK_GRAPH, 0, 0, 0, { P_SPEED }, 120 },
+    { "G STFT",  SK_GRAPH, 0, 0, 0, { P_STFT }, 60 },
+    { "ENG 2", SK_GRID, 3, 2, 3, { P_LOAD, P_ECT, P_THR, P_O2B, P_FSYS, P_DTC }, 0 },
 };

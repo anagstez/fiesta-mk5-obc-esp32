@@ -605,8 +605,9 @@ static int param_level(int id, int v)                /* 0 ok, 1 warning (amber),
 static uint16_t screen_pid_mask(int scr)
 {
     uint16_t m = 0;
-    if (scr < 0 || scr >= SCREEN_COUNT || SCREENS[scr].kind != SK_GRID) return 0;
-    for (int k = 0; k < 6; k++) {
+    if (scr < 0 || scr >= SCREEN_COUNT || SCREENS[scr].kind == SK_DRIVE) return 0;
+    const int n = SCREENS[scr].kind == SK_GRAPH ? 1 : 6;
+    for (int k = 0; k < n; k++) {
         switch (SCREENS[scr].item[k]) {
         case P_IAT:    m |= 1 << Q_IAT; break;
         case P_TIMING: m |= 1 << Q_TIMING; break;
@@ -652,6 +653,102 @@ static void draw_grid(const screen_cfg_t *sc)
     if (!car_live) draw_text(LCD_W - 4 - text_w("NO CAN", 1), 2, 1, RED, "NO CAN");
 }
 
+/* ---- graph screens (SK_GRAPH): ring of samples per screen ---- */
+#define HIST_N   180                         /* plot width in px = samples in the window */
+#define PLOT_X   100
+#define NO_SAMPLE INT16_MIN
+static int16_t hist[SCREEN_COUNT][HIST_N];   /* ring, newest at hist_head - 1 */
+static uint16_t hist_head[SCREEN_COUNT];
+static uint32_t hist_acc[SCREEN_COUNT];
+
+static uint32_t graph_period_ms(const screen_cfg_t *sc)
+{
+    return (sc->span_s ? sc->span_s : 60) * 1000u / HIST_N;
+}
+
+/* called every frame with the frame time; records the shown parameter of every graph screen */
+static void graph_step(uint32_t dt_ms)
+{
+    static bool inited;
+    if (!inited) {                                           /* empty ring = no samples, not zeros */
+        for (int i = 0; i < SCREEN_COUNT; i++) for (int k = 0; k < HIST_N; k++) hist[i][k] = NO_SAMPLE;
+        inited = true;
+    }
+    for (int i = 0; i < SCREEN_COUNT; i++) {
+        if (SCREENS[i].kind != SK_GRAPH) continue;
+        const uint32_t per = graph_period_ms(&SCREENS[i]);
+        hist_acc[i] += dt_ms;
+        while (hist_acc[i] >= per) {
+            hist_acc[i] -= per;
+            int v;
+            const int id = SCREENS[i].item[0];
+            hist[i][hist_head[i]] = (id > P_NONE && id < NPARAM && param_get(id, &v)) ? clampi(v, -32000, 32000) : NO_SAMPLE;
+            hist_head[i] = (hist_head[i] + 1) % HIST_N;
+        }
+    }
+}
+
+static void draw_graph(int idx)
+{
+    const screen_cfg_t *sc = &SCREENS[idx];
+    const int id = sc->item[0];
+    if (id <= P_NONE || id >= NPARAM) return;
+    const int py0 = 4, ph = LCD_H - 8;                       /* plot rows py0 .. py0+ph-1 */
+    char b[16] = "--";
+    int v = 0, lvl = 0;
+    if (param_get(id, &v)) { param_text(id, v, b, sizeof(b)); lvl = param_level(id, v); }
+    int scale = 3;
+    while (scale > 1 && text_w(b, scale) > PLOT_X - 12) scale--;
+    draw_text(4, 12, 1, GRAY, PARAMS[id].label);
+    draw_text(4, 26, scale, lvl == 2 ? RED : lvl == 1 ? AMBER : WHITE, b);
+    char sp[12];
+    snprintf(sp, sizeof(sp), "%ds", sc->span_s ? sc->span_s : 60);
+    draw_text(4, LCD_H - 12, 1, GRAY, sp);
+
+    int lo = INT_MAX, hi = INT_MIN;                          /* range of the window */
+    for (int i = 0; i < HIST_N; i++) {
+        const int s = hist[idx][i];
+        if (s == NO_SAMPLE) continue;
+        if (s < lo) lo = s;
+        if (s > hi) hi = s;
+    }
+    fill_rect(PLOT_X - 4, py0, 1, ph, DIM);
+    fill_rect(PLOT_X - 4, py0 + ph, LCD_W - PLOT_X, 1, DIM);
+    if (lo > hi) {                                           /* nothing recorded yet */
+        draw_text(PLOT_X + 8, LCD_H / 2 - 3, 1, GRAY, "NO DATA");
+        if (!car_live) draw_text(4, 2, 1, RED, "NO CAN");
+        return;
+    }
+    const int dec = param_dec[id], min_span = dec ? 20 : 10; /* do not blow noise up to full height */
+    if (hi - lo < min_span) { const int mid = (hi + lo) / 2; lo = mid - min_span / 2; hi = lo + min_span; }
+    const int pad = (hi - lo) / 10 + 1;
+    lo -= pad; hi += pad;
+    #define GY(val) (py0 + ph - 1 - ((val) - lo) * (ph - 1) / (hi - lo))
+    const param_cfg_t *c = &PARAMS[id];
+    const int lim[4] = { c->warn_lo, c->warn_hi, c->alarm_lo, c->alarm_hi };
+    for (int k = 0; k < 4; k++) {                            /* dashed limit lines that fall inside the view */
+        if (lim[k] == NO_LO || lim[k] == NO_HI || lim[k] <= lo || lim[k] >= hi) continue;
+        const int y = GY(lim[k]);
+        for (int x = PLOT_X; x < LCD_W - 2; x += 4) fill_rect(x, y, 2, 1, k >= 2 ? RED : AMBER);
+    }
+    int prev = NO_SAMPLE;
+    for (int x = 0; x < HIST_N; x++) {                       /* oldest on the left */
+        const int s = hist[idx][(hist_head[idx] + x) % HIST_N];
+        if (s == NO_SAMPLE) { prev = NO_SAMPLE; continue; }
+        const int y = GY(s), y0 = prev == NO_SAMPLE ? y : GY(prev);
+        const int top = y < y0 ? y : y0, h = (y < y0 ? y0 - y : y - y0) + 1;
+        fill_rect(PLOT_X + x, top, 1, h, param_level(id, s) == 2 ? RED : param_level(id, s) == 1 ? AMBER : WHITE);
+        prev = s;
+    }
+    #undef GY
+    char t[16];
+    param_text(id, hi, t, sizeof(t));
+    draw_text(LCD_W - 2 - text_w(t, 1), py0 + 1, 1, GRAY, t);
+    param_text(id, lo, t, sizeof(t));
+    draw_text(LCD_W - 2 - text_w(t, 1), py0 + ph - 8, 1, GRAY, t);
+    if (!car_live) draw_text(4, 2, 1, RED, "NO CAN");
+}
+
 static void draw_menu(void);
 static volatile bool fb_dump;            /* 'F' over USB: print the next finished frame as hex (screenshot) */
 
@@ -680,6 +777,7 @@ static void render(void)
 
     if (screen >= SCREEN_COUNT)                   draw_menu();
     else if (SCREENS[screen].kind == SK_GRID)     draw_grid(&SCREENS[screen]);
+    else if (SCREENS[screen].kind == SK_GRAPH)    draw_graph(screen);
     else                                          draw_drive();
 
     if (fb_dump) { fb_dump = false; fb_print(); }
@@ -1348,6 +1446,7 @@ void app_main(void)
         if (dt >= FRAME_MS) {
             last_frame = now;
             car_step(dt);
+            graph_step(dt);
             cruise_step(dt / 1000.0f);
             render();
         }
