@@ -968,12 +968,13 @@ static void gem_hex(char *dst, size_t cap, const uint8_t *d, int n)
 
 static void gem_task(void *arg)
 {
+    const bool write = (bool)(intptr_t)arg;     /* 'W': enable lock-at-movement, otherwise read only */
     if (!car_live || car.speed != 0 || !(car.lights & LIGHT_PB)) {
         ESP_LOGW(TAG, "GEM read refused: need live CAN, speed 0 and the handbrake on");
         gem_busy = false;
         vTaskDelete(NULL);
     }
-    ESP_LOGW(TAG, "GEM read: MS-CAN switches to normal mode and TRANSMITS read-only requests to 0x%X", GEM_TX_ID);
+    ESP_LOGW(TAG, "GEM %s: MS-CAN switches to normal mode and TRANSMITS to 0x%X", write ? "WRITE" : "read", GEM_TX_ID);
     twai_node_disable(ms_node);
     twai_node_delete(ms_node);
     bool ok = can_open(false);
@@ -987,7 +988,48 @@ static void gem_task(void *arg)
         ESP_LOGI(TAG, "GEM 10 87 -> %s", n > 0 ? hx : "no answer");
         ok = n >= 2 && r[0] == 0x50;
     }
-    for (int lid = 1; ok && lid <= 3; lid++) {
+    if (write && ok) {
+        /* LID02 = As-Built bytes 5..9, so byte 7 is payload index 2 (r[4]); mask 0x80 = lock at start of movement.
+         * Only that one bit is changed, and only if the module still holds exactly the bytes saved as backup. */
+        const uint8_t rq[2] = { 0x21, 0x02 };
+        uint8_t bk[8] = { 0 };
+        size_t bk_len = sizeof(bk);
+        nvs_handle_t h;
+        const bool have_bk = nvs_open("obc", NVS_READONLY, &h) == ESP_OK && nvs_get_blob(h, "gem2", bk, &bk_len) == ESP_OK;
+        if (have_bk) nvs_close(h);
+        int n = gem_request(rq, 2, r, sizeof(r));
+        gem_hex(hx, sizeof(hx), r, n > 0 ? n : 0);
+        ESP_LOGI(TAG, "GEM 21 02 -> %s", n > 0 ? hx : "no answer");
+        if (n != 7 || r[0] != 0x61 || r[1] != 0x02) {
+            ESP_LOGE(TAG, "GEM write aborted: unexpected LID02 answer");
+        } else if (!have_bk || (int)bk_len != n || memcmp(bk, r, n) != 0) {
+            ESP_LOGE(TAG, "GEM write aborted: LID02 differs from the NVS backup (or no backup), nothing written");
+        } else if (r[4] & 0x80) {
+            ESP_LOGI(TAG, "GEM: lock at start of movement is already ON, nothing to do");
+        } else {
+            uint8_t wr[7] = { 0x3B, 0x02, r[2], r[3], (uint8_t)(r[4] | 0x80), r[5], r[6] };
+            gem_hex(hx, sizeof(hx), wr, 7);
+            ESP_LOGW(TAG, "GEM WRITE: %s", hx);
+            n = gem_request(wr, 7, r, sizeof(r));
+            gem_hex(hx, sizeof(hx), r, n > 0 ? n : 0);
+            ESP_LOGI(TAG, "GEM 3B 02 -> %s", n > 0 ? hx : "no answer");
+            const bool acked = n >= 2 && r[0] == 0x7B && r[1] == 0x02;
+            n = gem_request(rq, 2, r, sizeof(r));
+            gem_hex(hx, sizeof(hx), r, n > 0 ? n : 0);
+            ESP_LOGI(TAG, "GEM verify 21 02 -> %s", n > 0 ? hx : "no answer");
+            if (acked && n == 7 && r[4] == (bk[4] | 0x80) && !memcmp(r + 2, wr + 2, 5)) {
+                ESP_LOGW(TAG, "GEM write VERIFIED: lock at start of movement is ON");
+            } else {
+                ESP_LOGE(TAG, "GEM write NOT verified, restoring the backup");
+                uint8_t rs[7] = { 0x3B, 0x02, bk[2], bk[3], bk[4], bk[5], bk[6] };
+                n = gem_request(rs, 7, r, sizeof(r));
+                gem_hex(hx, sizeof(hx), r, n > 0 ? n : 0);
+                ESP_LOGW(TAG, "GEM restore 3B 02 -> %s", n > 0 ? hx : "no answer");
+                ok = false;
+            }
+        }
+    }
+    for (int lid = 1; ok && !write && lid <= 3; lid++) {
         const uint8_t rq[2] = { 0x21, (uint8_t)lid };
         int n = gem_request(rq, 2, r, sizeof(r));
         gem_hex(hx, sizeof(hx), r, n > 0 ? n : 0);
@@ -1095,7 +1137,7 @@ void app_main(void)
                 else if (line[0] == 'S') cruise_toggle();
                 else if (line[0] == '+') cruise_adjust(cc_step);
                 else if (line[0] == '-') cruise_adjust(-cc_step);
-                else if (line[0] == 'G' && !gem_busy) { gem_busy = true; xTaskCreate(gem_task, "gem", 4096, NULL, 4, NULL); }
+                else if ((line[0] == 'G' || line[0] == 'W') && !gem_busy) { gem_busy = true; xTaskCreate(gem_task, "gem", 5120, (void *)(intptr_t)(line[0] == 'W'), 4, NULL); }
                 else if (line[0] == 'D') {
                     dump_on = !dump_on;
                     ESP_LOGI(TAG, "dump %s", dump_on ? "ON (M=MS-CAN, H=HS-CAN, changes only)" : "OFF");
