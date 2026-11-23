@@ -373,7 +373,7 @@ function check() {
   if (state.screens[0].kind !== 'DRIVE') msgs.push(['bad', 'Перший екран має бути DRIVE.']);
   if (s.kind === 'GRAPH') {
     if (!s.items[0]) msgs.push(['warn', 'Параметр графіка не вибрано.']);
-    else if (s.items.some(i => i && isObd(byIndex(PID[i])))) msgs.push(['ok', 'OBD-параметр пишеться в історію лише поки цей екран показується (на графіку будуть прогалини).']);
+    else if (s.items.some(i => i && isObd(byIndex(PID[i])))) msgs.push(['ok', 'OBD-параметри пишуться в історію постійно: плата опитує PCM, поки є CAN.']);
     msgs.push(['ok', 'Графік пишеться, поки плата ввімкнена; крива в прев\'ю синтетична, навколо демо-значення.']);
     if (graphIds(s).length > 1) msgs.push(['ok', 'Кілька ліній: кожна масштабується за власним мін..макс (одиниці різні), без чисел шкали й без пунктиру порогів. Кольори: білий, зелений, рожевий.']);
     if (s.items.some((i, k) => i && k > 0 && !s.items[k - 1])) msgs.push(['bad', 'Порожній слот між параметрами: прошивка читає лише підряд заповнені слоти.']);
@@ -391,7 +391,7 @@ function check() {
       const sc = s.scale || 3;
       if (textW(v, sc) > g.cw - 8 || 7 + 4 + 7 * sc > g.ch - 2) msgs.push(['warn', `Клітинка ${k + 1} (${id}): значення не вміщається на масштабі ${sc}, прошивка зменшить шрифт.`]);
     }
-    if (s.items.some(i => i && isObd(byIndex(PID[i])))) msgs.push(['ok', 'Є параметри з OBD: плата запитує їх у PCM лише поки цей екран показується.']);
+    if (s.items.some(i => i && isObd(byIndex(PID[i])))) msgs.push(['ok', 'Є параметри з OBD: плата опитує PCM постійно (read-only Mode 01); параметри показаного екрана — вдвічі частіше.']);
   }
   for (const m of META) {
     const bad = [...state.params[m.id][0]].filter(c => c !== ' ' && !FONT[c]);
@@ -422,12 +422,13 @@ function exportH() {
  *  - A SK_GRAPH screen plots 1..3 parameters (item[0..2]) over time: a scrolling line over the last span_s
  *    seconds (0 = 60) and the current values on the left. One parameter: min/max of the window at the right,
  *    warn/alarm limits as dashed lines, the line coloured by level. Two or three: each line is scaled to its
- *    own min..max (units differ) and has its own colour (white, green, pink), no scale numbers. It records only while the board is powered; an OBD parameter
- *    is recorded only while that screen is shown (gaps otherwise).
+ *    own min..max (units differ) and has its own colour (white, green, pink), no scale numbers. It records while the board is powered; OBD parameters too,
+ *    since they are polled non-stop.
  *  - Labels may use only the characters of font[] in main.c (digits . % - : / A-Z subset); a missing letter
  *    is silently skipped, so add it to font[] first.
- *  - Parameters marked [OBD] come from OBD-II requests to the PCM: they are asked for (read-only Mode 01) only
- *    while a screen that shows them is on, and read "--" until the PCM answers.
+ *  - Parameters marked [OBD] come from OBD-II requests to the PCM (read-only Mode 01). Every [OBD] parameter used
+ *    by any screen is polled non-stop while CAN is alive, those of the screen shown twice as often; they read
+ *    "--" until the PCM answers.
  */
 #include <limits.h>
 #include <stdint.h>

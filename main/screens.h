@@ -10,15 +10,16 @@
  *  - A SK_GRAPH screen plots 1..3 parameters (item[0..2]) over time: a scrolling line over the last span_s
  *    seconds (0 = 60) and the current values on the left. One parameter: min/max of the window at the right,
  *    warn/alarm limits as dashed lines, the line coloured by level. Two or three: each line is scaled to its
- *    own min..max (units differ) and has its own colour (white, green, pink), no scale numbers. It records only while the board is powered; an OBD parameter
- *    is recorded only while that screen is shown (gaps otherwise).
+ *    own min..max (units differ) and has its own colour (white, green, pink), no scale numbers. It records while the board is powered; OBD parameters too,
+ *    since they are polled non-stop.
  *  - PARAMS[]   per parameter: the label printed above the value (incl. unit) and warning thresholds.
  *    Thresholds are in the parameter's own raw unit (see the comment on each enum value); the value turns
  *    AMBER outside warn_lo..warn_hi and RED outside alarm_lo..alarm_hi. NO_LO / NO_HI switch a limit off.
  *  - Labels may use only the characters of font[] in main.c (digits . % - : / A-Z subset); a missing letter
  *    is silently skipped, so add it to font[] first.
- *  - Parameters marked [OBD] come from OBD-II requests to the PCM: they are asked for (read-only Mode 01) only
- *    while a screen that shows them is on, and read "--" until the PCM answers.
+ *  - Parameters marked [OBD] come from OBD-II requests to the PCM (read-only Mode 01). Every [OBD] parameter used
+ *    by any screen is polled non-stop while CAN is alive, those of the screen shown twice as often; they read
+ *    "--" until the PCM answers.
  */
 #include <limits.h>
 #include <stdint.h>

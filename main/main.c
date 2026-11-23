@@ -1099,27 +1099,34 @@ static void hs_task(void *arg)
     }
     uint32_t frames = 0, last_log = 0;
     mcp_frame_t f;
-    /* OBD-II Mode 01 read-only polling (functional request 0x7DF, PCM answers 0x7E8); only the PIDs of the screen shown */
-    size_t pid_i = 0;
+    /* OBD-II Mode 01 read-only polling (functional request 0x7DF, PCM answers 0x7E8), non-stop while CAN is alive:
+       the PIDs of every configured screen (so graphs keep recording), those of the screen shown asked every other request */
+    uint16_t all = 0;
+    for (int i = 0; i < SCREEN_COUNT; i++) all |= screen_pid_mask(i);
+    size_t pid_i = 0, bg_i = 0;
+    bool turn_shown = true;
     TickType_t next_req = 0;
     int unanswered = 0;
     uint32_t n_sent = 0, n_ans = 0, n_busy = 0;
     while (1) {
         xSemaphoreTake(mcp2515_rx_sem(), pdMS_TO_TICKS(50));
         const TickType_t tn = xTaskGetTickCount();
-        const uint16_t need = screen_pid_mask(screen);
-        if (need && car_live && (int32_t)(tn - next_req) >= 0) {
-            for (int t = 0; t < NQ && !(need >> pid_i & 1); t++) pid_i = (pid_i + 1) % NQ;
-            const uint8_t rq[8] = { 0x02, 0x01, obd_pids[pid_i], 0, 0, 0, 0, 0 };
+        const uint16_t shown = screen_pid_mask(screen);
+        if (all && car_live && (int32_t)(tn - next_req) >= 0) {
+            const uint16_t mask = (turn_shown && shown) ? shown : all;
+            size_t *idx = (turn_shown && shown) ? &pid_i : &bg_i;
+            for (int t = 0; t < NQ && !(mask >> *idx & 1); t++) *idx = (*idx + 1) % NQ;
+            const uint8_t rq[8] = { 0x02, 0x01, obd_pids[*idx], 0, 0, 0, 0, 0 };
             if (mcp2515_send(0x7DF, rq, 8)) {
-                pid_i = (pid_i + 1) % NQ;
+                *idx = (*idx + 1) % NQ;
+                turn_shown = !turn_shown;
                 unanswered++;
                 n_sent++;
             } else {
                 n_busy++;
             }
-            /* ~7 requests/s; a silent PCM (20 in a row without any answer) is polled once per 5 s only */
-            next_req = tn + pdMS_TO_TICKS(unanswered > 20 ? 5000 : 140);
+            /* ~10 requests/s; a silent PCM (20 in a row without any answer) is polled once per 5 s only */
+            next_req = tn + pdMS_TO_TICKS(unanswered > 20 ? 5000 : 100);
         }
         while (mcp2515_read(&f)) {
             frames++;
