@@ -19,10 +19,10 @@ export IDF_PATH=/Users/name/.espressif/v6.0.2/esp-idf IDF_PYTHON_ENV_PATH=/Users
 ```
 
 - Збірка: `idf.py build` (перший раз — `idf.py set-target esp32s3`)
-- Прошивка: `idf.py -p /dev/cu.usbmodem101 flash` (порт плаває між `usbmodem101` і `usbmodem1101` — перевір `ls /dev/cu.*`) (дозволена без підтвердження глобальними дозволами)
+- Прошивка: `idf.py -p /dev/cu.usbmodem101 flash` (порт плаває між `usbmodem101`, `usbmodem1101` і `usbmodem<серійник>` залежно від плати/гнізда — перевір `ls /dev/cu.*`) (дозволена без підтвердження глобальними дозволами)
 - Конфіг: `idf.py menuconfig`
 - Лог плати без TTY (`idf.py monitor` у `!`/неінтерактивному shell не працює — «requires standard input to be
-  attached to TTY»): читати порт через pyserial **з `timeout=`** у `Serial(...)`, інакше `read()` зависає назавжди.
+  attached to TTY»): відкриття порту скидає плату (`USB_UART_CHIP_RESET`), тож скрипти беруть порт через `tools/obc_serial.py` (DTR/RTS low + чекає `obc: ready`); читати порт через pyserial **з `timeout=`** у `Serial(...)`, інакше `read()` зависає назавжди.
 
 Тестів і лінтера немає; перевірка — візуальна на залізі. Піни дисплея описані в `README.md`. Діагностики clangd
 (`sys/features.h`, `__assert_func`, `usb_serial_jtag.h not found` тощо) — шум: clangd парсить хост-компілятором macOS,

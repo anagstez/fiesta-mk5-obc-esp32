@@ -5,7 +5,8 @@ usage: guided.py OUT.log [port]
 The schedule below is what produced dumps/guided2-*.log: 5 s holds, 8 s rests.
 """
 import os, subprocess, sys, time
-import serial
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from obc_serial import open_board
 
 STEPS = [(10, "brake now. press and hold", "BRAKE_ON"), (15, "release brake", "RELEASE"),
          (23, "brake now. press and hold", "BRAKE_ON"), (28, "release brake", "RELEASE"),
@@ -15,9 +16,7 @@ STEPS = [(10, "brake now. press and hold", "BRAKE_ON"), (15, "release brake", "R
          (75, "gas now. raise revs", "GAS_ON"), (80, "release gas", "RELEASE")]
 END = 90
 out = open(sys.argv[1], "w", buffering=1)
-port = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("OBC_PORT", "/dev/cu.usbmodem101")
-s = serial.Serial(port, 115200, timeout=0.2)
-s.reset_input_buffer()
+s = open_board(sys.argv[2] if len(sys.argv) > 2 else None, timeout=0.2)
 s.write(b"D\n")
 t0, checked, k = time.time(), False, 0
 subprocess.Popen(["say", "Recording starts. Get ready. Do nothing for ten seconds."])

@@ -4,11 +4,11 @@
 usage: screenshot.py OUT.png [port]   (stdlib + pyserial; writes a PNG without PIL)
 """
 import os, struct, sys, time, zlib
-import serial
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from obc_serial import open_board
 
 W, H = 284, 76
-port = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("OBC_PORT", "/dev/cu.usbmodem101")
-s = serial.Serial(port, 115200, timeout=1)
+s = open_board(sys.argv[2] if len(sys.argv) > 2 else None)
 for _ in range(4):                               # the USB FIFO sometimes drops a few bytes: retry
     s.reset_input_buffer()
     s.write(b"F\n")
