@@ -205,6 +205,7 @@ const DEFAULTS = {
     { name: 'ENG', kind: 'GRID', cols: 3, rows: 2, scale: 3, items: ['MAP', 'IAT', 'TIMING', 'STFT', 'LTFT', 'O2A'] },
     { name: 'G SPEED', kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: 120, items: ['SPEED'] },
     { name: 'G STFT', kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: 60, items: ['STFT'] },
+    { name: 'G DRIVE', kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: 60, items: ['RPM', 'SPEED', 'GAS'] },
     { name: 'ENG 2', kind: 'GRID', cols: 3, rows: 2, scale: 3, items: ['LOAD', 'ECT', 'THR', 'O2B', 'FSYS', 'DTC'] }
   ]
 };
@@ -286,7 +287,46 @@ function drawScreen(canvas, s) {
 
 /* graph preview: mirrors draw_graph(); the curve is synthetic, centred on the demo value */
 const HIST_N = 180, PLOT_X = 100;
+const SER = [COLORS.WHITE, '#6eff82', '#ff96ff'];
+function graphIds(s) { const r = []; for (let i = 0; i < 3 && s.items[i] && PID[s.items[i]]; i++) r.push(s.items[i]); return r; }
+function synth(id, j) {
+  const d = demo[id], m = META[PID[id] - 1], amp = Math.max(m.dec ? 20 : 10, Math.abs(d) * 0.3), out = [];
+  for (let x = 0; x < HIST_N; x++) out.push((j === 1 && x % 70 > 62) ? null : Math.round(d + amp * Math.sin(x / (9 + 4 * j)) * (0.5 + x / 360)));
+  return out;
+}
+function drawGraphMulti(ctx, s, ids) {
+  const n = ids.length, py0 = 4, ph = H - 8, row = Math.trunc(H / n);
+  ids.forEach((id, j) => {
+    const ser = synth(id, j), cur = ser[HIST_N - 1], lvl = cur === null ? 0 : level(id, cur);
+    const b = cur === null ? '--' : fmt(id, cur), sc = n === 2 ? 3 : 2;
+    const top = j * row + Math.trunc((row - (7 + 3 + 7 * sc)) / 2);
+    drawText(ctx, 4, top, 1, SER[j], state.params[id][0]);
+    drawText(ctx, 4, top + 10, sc, lvl === 2 ? COLORS.RED : lvl === 1 ? COLORS.AMBER : SER[j], b);
+  });
+  ctx.fillStyle = COLORS.DIM;
+  ctx.fillRect(PLOT_X - 4, py0, 1, ph); ctx.fillRect(PLOT_X - 4, py0 + ph, W - PLOT_X, 1);
+  ids.forEach((id, j) => {
+    const ser = synth(id, j), vals = ser.filter(v => v !== null), m = META[PID[id] - 1];
+    let lo = Math.min(...vals), hi = Math.max(...vals);
+    const ms = m.dec ? 20 : 10;
+    if (hi - lo < ms) { const mid = Math.trunc((hi + lo) / 2); lo = mid - Math.trunc(ms / 2); hi = lo + ms; }
+    const gy = v => py0 + ph - 1 - Math.trunc((v - lo) * (ph - 1) / (hi - lo));
+    let prev = null;
+    ctx.fillStyle = SER[j];
+    ser.forEach((v, x) => {
+      if (v === null) { prev = null; return; }
+      const y = gy(v), y0 = prev === null ? y : gy(prev);
+      ctx.fillRect(PLOT_X + x, Math.min(y, y0), 1, Math.abs(y - y0) + 1);
+      prev = v;
+    });
+  });
+  const sp = (s.span || 60) + 'S';
+  ctx.fillStyle = COLORS.DIM; ctx.fillRect(W - 6 - textW(sp, 1), 2, textW(sp, 1) + 4, 9);
+  drawText(ctx, W - 4 - textW(sp, 1), 3, 1, COLORS.GRAY, sp);
+}
 function drawGraph(ctx, s) {
+  const ids = graphIds(s);
+  if (ids.length > 1) { drawGraphMulti(ctx, s, ids); return; }
   const id = s.items[0];
   if (!id || !PID[id]) return;
   const m = META[PID[id] - 1], c = state.params[id];
@@ -333,8 +373,10 @@ function check() {
   if (state.screens[0].kind !== 'DRIVE') msgs.push(['bad', 'Перший екран має бути DRIVE.']);
   if (s.kind === 'GRAPH') {
     if (!s.items[0]) msgs.push(['warn', 'Параметр графіка не вибрано.']);
-    else if (isObd(byIndex(PID[s.items[0]]))) msgs.push(['ok', 'OBD-параметр пишеться в історію лише поки цей екран показується (на графіку будуть прогалини).']);
+    else if (s.items.some(i => i && isObd(byIndex(PID[i])))) msgs.push(['ok', 'OBD-параметр пишеться в історію лише поки цей екран показується (на графіку будуть прогалини).']);
     msgs.push(['ok', 'Графік пишеться, поки плата ввімкнена; крива в прев\'ю синтетична, навколо демо-значення.']);
+    if (graphIds(s).length > 1) msgs.push(['ok', 'Кілька ліній: кожна масштабується за власним мін..макс (одиниці різні), без чисел шкали й без пунктиру порогів. Кольори: білий, зелений, рожевий.']);
+    if (s.items.some((i, k) => i && k > 0 && !s.items[k - 1])) msgs.push(['bad', 'Порожній слот між параметрами: прошивка читає лише підряд заповнені слоти.']);
   }
   if (s.kind === 'GRID') {
     if ((s.cols || 3) * (s.rows || 1) > 6) msgs.push(['bad', 'Клітинок більше 6: прошивка обріже сітку.']);
@@ -377,9 +419,10 @@ function exportH() {
  *  - PARAMS[]   per parameter: the label printed above the value (incl. unit) and warning thresholds.
  *    Thresholds are in the parameter's own raw unit (see the comment on each enum value); the value turns
  *    AMBER outside warn_lo..warn_hi and RED outside alarm_lo..alarm_hi. NO_LO / NO_HI switch a limit off.
- *  - A SK_GRAPH screen plots ONE parameter (item[0]) over time: a scrolling line over the last span_s seconds
- *    (0 = 60), the current value on the left, min/max of the window at the right, warn/alarm limits as dashed
- *    lines, the line itself coloured by level. It records only while the board is powered; an OBD parameter
+ *  - A SK_GRAPH screen plots 1..3 parameters (item[0..2]) over time: a scrolling line over the last span_s
+ *    seconds (0 = 60) and the current values on the left. One parameter: min/max of the window at the right,
+ *    warn/alarm limits as dashed lines, the line coloured by level. Two or three: each line is scaled to its
+ *    own min..max (units differ) and has its own colour (white, green, pink), no scale numbers. It records only while the board is powered; an OBD parameter
  *    is recorded only while that screen is shown (gaps otherwise).
  *  - Labels may use only the characters of font[] in main.c (digits . % - : / A-Z subset); a missing letter
  *    is silently skipped, so add it to font[] first.
@@ -415,14 +458,14 @@ typedef struct {
     uint8_t kind;               /* SK_DRIVE (fixed gauge layout) or SK_GRID */
     uint8_t cols, rows;         /* SK_GRID: 1..3 x 1..2 and so on, cols * rows <= 6 */
     uint8_t max_scale;          /* SK_GRID: biggest font scale, 0 = 3 */
-    uint8_t item[6];            /* SK_GRID: P_* per cell; SK_GRAPH: item[0] is the plotted parameter */
+    uint8_t item[6];            /* SK_GRID: P_* per cell; SK_GRAPH: item[0..2] are the plotted parameters */
     uint16_t span_s;            /* SK_GRAPH: time window in seconds, 0 = 60 */
 } screen_cfg_t;
 
 static const screen_cfg_t SCREENS[] = {`);
   state.screens.forEach(s => {
     if (s.kind === 'DRIVE') { out.push(`    { "${s.name}", SK_DRIVE, 0, 0, 0, { 0 }, 0 },`); return; }
-    if (s.kind === 'GRAPH') { out.push(`    { ${pad('"' + s.name + '",', 10)} SK_GRAPH, 0, 0, 0, { ${s.items[0] ? 'P_' + s.items[0] : 0} }, ${s.span || 0} },`); return; }
+    if (s.kind === 'GRAPH') { out.push(`    { ${pad('"' + s.name + '",', 10)} SK_GRAPH, 0, 0, 0, { ${graphIds(s).map(i => 'P_' + i).join(', ') || 0} }, ${s.span || 0} },`); return; }
     let n = s.items.length;
     while (n && !s.items[n - 1]) n--;
     const items = s.items.slice(0, n).map(i => i ? 'P_' + i : 'P_NONE').join(', ');
@@ -441,8 +484,8 @@ function importH(text) {
   const tail = text.slice(Math.max(0, text.indexOf('SCREENS[]')));
   for (const m of tail.matchAll(/\{\s*"([^"]*)"\s*,\s*SK_(DRIVE|GRID|GRAPH)(?:\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*\{([^}]*)\}(?:\s*,\s*(\d+))?)?/g)) {
     if (m[2] === 'GRAPH') {
-      const t = (m[6] || '').split(',')[0].trim().replace(/^P_/, '');
-      screens.push({ name: m[1], kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: +(m[7] || 0), items: [PID[t] ? t : null] });
+      const its = (m[6] || '').split(',').map(t => t.trim().replace(/^P_/, '')).map(t => PID[t] ? t : null).slice(0, 3);
+      screens.push({ name: m[1], kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: +(m[7] || 0), items: its });
       continue;
     }
     if (m[2] === 'DRIVE') { screens.push({ name: m[1], kind: 'DRIVE', cols: 0, rows: 0, scale: 0, items: [] }); continue; }
@@ -493,14 +536,15 @@ function renderEditor() {
   if (s.kind === 'GRAPH') {
     const f = numField(s.span, v => { s.span = v === null ? 0 : v; save(); renderAll(true); }, 10, 3600);
     f.value = s.span; props.append(el('label', {}, 'вікно, с (0 = 60) ', f));
-    const sel = el('select');
-    sel.append(el('option', { value: '', textContent: '— не вибрано —' }));
-    META.forEach(m => sel.append(el('option', { value: m.id, textContent: `${state.params[m.id][0]}  (${m.id})` })));
-    sel.value = s.items[0] || '';
-    sel.onchange = () => { s.items[0] = sel.value || null; save(); renderAll(); };
-    cp.append(el('label', {}, 'параметр: ', sel));
-    const id = s.items[0];
-    if (id) cp.append(el('div', { className: 'hint', style: 'flex-basis:100%', textContent: byIndex(PID[id]).unit + ' — ' + DESC[id] }));
+    for (let j = 0; j < 3; j++) {
+      const sel = el('select');
+      sel.append(el('option', { value: '', textContent: j ? '— немає —' : '— не вибрано —' }));
+      META.forEach(m => sel.append(el('option', { value: m.id, textContent: `${state.params[m.id][0]}  (${m.id})` })));
+      sel.value = s.items[j] || '';
+      sel.onchange = () => { s.items[j] = sel.value || null; while (s.items.length < 3) s.items.push(null); save(); renderAll(); };
+      cp.append(el('label', {}, `лінія ${j + 1}: `, sel));
+    }
+    graphIds(s).forEach(id => cp.append(el('div', { className: 'hint', style: 'flex-basis:100%', textContent: state.params[id][0] + ': ' + byIndex(PID[id]).unit + ' — ' + DESC[id] })));
     const ul = $('msgs'); ul.replaceChildren();
     check().forEach(([k, t]) => ul.append(el('li', { className: k, textContent: t })));
     return;

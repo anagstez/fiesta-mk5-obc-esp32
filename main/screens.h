@@ -7,9 +7,10 @@
  *               menu EXIT work with it).
  *  - A SK_GRID screen is cols x rows cells (cols * rows <= 6) filled from item[] left to right, top to bottom.
  *    max_scale = biggest font scale (1..4, 0 = 3); a value that does not fit its cell is shrunk automatically.
- *  - A SK_GRAPH screen plots ONE parameter (item[0]) over time: a scrolling line over the last span_s seconds
- *    (0 = 60), the current value on the left, min/max of the window at the right, warn/alarm limits as dashed
- *    lines, the line itself coloured by level. It records only while the board is powered; an OBD parameter
+ *  - A SK_GRAPH screen plots 1..3 parameters (item[0..2]) over time: a scrolling line over the last span_s
+ *    seconds (0 = 60) and the current values on the left. One parameter: min/max of the window at the right,
+ *    warn/alarm limits as dashed lines, the line coloured by level. Two or three: each line is scaled to its
+ *    own min..max (units differ) and has its own colour (white, green, pink), no scale numbers. It records only while the board is powered; an OBD parameter
  *    is recorded only while that screen is shown (gaps otherwise).
  *  - PARAMS[]   per parameter: the label printed above the value (incl. unit) and warning thresholds.
  *    Thresholds are in the parameter's own raw unit (see the comment on each enum value); the value turns
@@ -101,7 +102,7 @@ typedef struct {
     uint8_t kind;               /* SK_DRIVE (fixed gauge layout) or SK_GRID */
     uint8_t cols, rows;         /* SK_GRID: 1..3 x 1..2 and so on, cols * rows <= 6 */
     uint8_t max_scale;          /* SK_GRID: biggest font scale, 0 = 3 */
-    uint8_t item[6];            /* SK_GRID: P_* per cell; SK_GRAPH: item[0] is the plotted parameter */
+    uint8_t item[6];            /* SK_GRID: P_* per cell; SK_GRAPH: item[0..2] are the plotted parameters */
     uint16_t span_s;            /* SK_GRAPH: time window in seconds, 0 = 60 */
 } screen_cfg_t;
 
@@ -112,5 +113,6 @@ static const screen_cfg_t SCREENS[] = {
     { "ENG",   SK_GRID, 3, 2, 3, { P_MAP, P_IAT, P_TIMING, P_STFT, P_LTFT, P_O2A }, 0 },
     { "G SPEED", SK_GRAPH, 0, 0, 0, { P_SPEED }, 120 },
     { "G STFT",  SK_GRAPH, 0, 0, 0, { P_STFT }, 60 },
+    { "G DRIVE", SK_GRAPH, 0, 0, 0, { P_RPM, P_SPEED, P_GAS }, 60 },
     { "ENG 2", SK_GRID, 3, 2, 3, { P_LOAD, P_ECT, P_THR, P_O2B, P_FSYS, P_DTC }, 0 },
 };

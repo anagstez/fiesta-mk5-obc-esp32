@@ -77,6 +77,7 @@ static const char *TAG = "obc";
 
 #define SCREEN_COUNT ((int)(sizeof(SCREENS) / sizeof(SCREENS[0])))   /* screens.h */
 #define SCR_DRIVE 0                  /* SCREENS[0] */
+#define GSER      3                  /* parameters per SK_GRAPH screen */
 #define SCR_MENU  SCREEN_COUNT       /* after the configured screens, entered by a 5 s hold */
 #define NCYCLE    SCREEN_COUNT       /* screens in the turn cycle */
 #define LONG_MS   700                /* hold in the menu: back to DRIVE */
@@ -193,6 +194,8 @@ static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b)
 #define ICE    rgb(150, 235, 255)
 #define AMBER  rgb(255, 190, 0)
 #define RED    rgb(255, 70, 70)
+#define SER_B  rgb(110, 255, 130)           /* 2nd and 3rd line of a multi-parameter graph (1st is WHITE) */
+#define SER_C  rgb(255, 150, 255)
 #define FORD_BLUE rgb(0, 40, 125)
 #define GREEN_ON  rgb(70, 235, 110)
 #define CHIP_FG   rgb(0, 20, 60)
@@ -606,7 +609,7 @@ static uint16_t screen_pid_mask(int scr)
 {
     uint16_t m = 0;
     if (scr < 0 || scr >= SCREEN_COUNT || SCREENS[scr].kind == SK_DRIVE) return 0;
-    const int n = SCREENS[scr].kind == SK_GRAPH ? 1 : 6;
+    const int n = SCREENS[scr].kind == SK_GRAPH ? GSER : 6;
     for (int k = 0; k < n; k++) {
         switch (SCREENS[scr].item[k]) {
         case P_IAT:    m |= 1 << Q_IAT; break;
@@ -657,7 +660,7 @@ static void draw_grid(const screen_cfg_t *sc)
 #define HIST_N   180                         /* plot width in px = samples in the window */
 #define PLOT_X   100
 #define NO_SAMPLE INT16_MIN
-static int16_t hist[SCREEN_COUNT][HIST_N];   /* ring, newest at hist_head - 1 */
+static int16_t hist[SCREEN_COUNT][GSER][HIST_N];   /* rings, newest at hist_head - 1 */
 static uint16_t hist_head[SCREEN_COUNT];
 static uint32_t hist_acc[SCREEN_COUNT];
 
@@ -671,7 +674,7 @@ static void graph_step(uint32_t dt_ms)
 {
     static bool inited;
     if (!inited) {                                           /* empty ring = no samples, not zeros */
-        for (int i = 0; i < SCREEN_COUNT; i++) for (int k = 0; k < HIST_N; k++) hist[i][k] = NO_SAMPLE;
+        for (int i = 0; i < SCREEN_COUNT; i++) for (int j = 0; j < GSER; j++) for (int k = 0; k < HIST_N; k++) hist[i][j][k] = NO_SAMPLE;
         inited = true;
     }
     for (int i = 0; i < SCREEN_COUNT; i++) {
@@ -680,19 +683,20 @@ static void graph_step(uint32_t dt_ms)
         hist_acc[i] += dt_ms;
         while (hist_acc[i] >= per) {
             hist_acc[i] -= per;
-            int v;
-            const int id = SCREENS[i].item[0];
-            hist[i][hist_head[i]] = (id > P_NONE && id < NPARAM && param_get(id, &v)) ? clampi(v, -32000, 32000) : NO_SAMPLE;
+            for (int j = 0; j < GSER; j++) {
+                int v;
+                const int id = SCREENS[i].item[j];
+                hist[i][j][hist_head[i]] = (id > P_NONE && id < NPARAM && param_get(id, &v)) ? clampi(v, -32000, 32000) : NO_SAMPLE;
+            }
             hist_head[i] = (hist_head[i] + 1) % HIST_N;
         }
     }
 }
 
-static void draw_graph(int idx)
+static void draw_graph1(int idx)
 {
     const screen_cfg_t *sc = &SCREENS[idx];
     const int id = sc->item[0];
-    if (id <= P_NONE || id >= NPARAM) return;
     const int py0 = 4, ph = LCD_H - 8;                       /* plot rows py0 .. py0+ph-1 */
     char b[16] = "--";
     int v = 0, lvl = 0;
@@ -707,7 +711,7 @@ static void draw_graph(int idx)
 
     int lo = INT_MAX, hi = INT_MIN;                          /* range of the window */
     for (int i = 0; i < HIST_N; i++) {
-        const int s = hist[idx][i];
+        const int s = hist[idx][0][i];
         if (s == NO_SAMPLE) continue;
         if (s < lo) lo = s;
         if (s > hi) hi = s;
@@ -733,7 +737,7 @@ static void draw_graph(int idx)
     }
     int prev = NO_SAMPLE;
     for (int x = 0; x < HIST_N; x++) {                       /* oldest on the left */
-        const int s = hist[idx][(hist_head[idx] + x) % HIST_N];
+        const int s = hist[idx][0][(hist_head[idx] + x) % HIST_N];
         if (s == NO_SAMPLE) { prev = NO_SAMPLE; continue; }
         const int y = GY(s), y0 = prev == NO_SAMPLE ? y : GY(prev);
         const int top = y < y0 ? y : y0, h = (y < y0 ? y0 - y : y - y0) + 1;
@@ -747,6 +751,64 @@ static void draw_graph(int idx)
     param_text(id, lo, t, sizeof(t));
     draw_text(LCD_W - 2 - text_w(t, 1), py0 + ph - 8, 1, GRAY, t);
     if (!car_live) draw_text(4, 2, 1, RED, "NO CAN");
+}
+
+/* 2..3 parameters on one plot: each line is scaled to its own min..max (different units), colour = series */
+static void draw_graph_multi(int idx, int n)
+{
+    const screen_cfg_t *sc = &SCREENS[idx];
+    const uint16_t col[GSER] = { WHITE, SER_B, SER_C };
+    const int py0 = 4, ph = LCD_H - 8, row = LCD_H / n;
+    for (int j = 0; j < n; j++) {                            /* left column: label + current value per series */
+        const int id = sc->item[j];
+        char b[16] = "--";
+        int v = 0, lvl = 0;
+        if (param_get(id, &v)) { param_text(id, v, b, sizeof(b)); lvl = param_level(id, v); }
+        const int scale = n == 2 ? 3 : 2;
+        const int top = j * row + (row - (7 + 3 + 7 * scale)) / 2;
+        draw_text(4, top, 1, col[j], PARAMS[id].label);
+        draw_text(4, top + 10, scale, lvl == 2 ? RED : lvl == 1 ? AMBER : col[j], b);
+    }
+    fill_rect(PLOT_X - 4, py0, 1, ph, DIM);
+    fill_rect(PLOT_X - 4, py0 + ph, LCD_W - PLOT_X, 1, DIM);
+    for (int j = 0; j < n; j++) {
+        const int id = sc->item[j];
+        int lo = INT_MAX, hi = INT_MIN;
+        for (int i = 0; i < HIST_N; i++) {
+            const int s = hist[idx][j][i];
+            if (s == NO_SAMPLE) continue;
+            if (s < lo) lo = s;
+            if (s > hi) hi = s;
+        }
+        if (lo > hi) continue;
+        const int min_span = param_dec[id] ? 20 : 10;
+        if (hi - lo < min_span) { const int mid = (hi + lo) / 2; lo = mid - min_span / 2; hi = lo + min_span; }
+        int prev = NO_SAMPLE;
+        for (int x = 0; x < HIST_N; x++) {
+            const int s = hist[idx][j][(hist_head[idx] + x) % HIST_N];
+            if (s == NO_SAMPLE) { prev = NO_SAMPLE; continue; }
+            const int y = py0 + ph - 1 - (s - lo) * (ph - 1) / (hi - lo);
+            const int y0 = prev == NO_SAMPLE ? y : py0 + ph - 1 - (prev - lo) * (ph - 1) / (hi - lo);
+            fill_rect(PLOT_X + x, y < y0 ? y : y0, 1, (y < y0 ? y0 - y : y - y0) + 1, col[j]);
+            prev = s;
+        }
+    }
+    char sp[12];
+    snprintf(sp, sizeof(sp), "%ds", sc->span_s ? sc->span_s : 60);
+    fill_rect(LCD_W - 6 - text_w(sp, 1), 2, text_w(sp, 1) + 4, 9, DIM);      /* label over the lines */
+    draw_text(LCD_W - 4 - text_w(sp, 1), 3, 1, GRAY, sp);
+    if (!car_live) {
+        fill_rect(LCD_W - 8 - text_w("NO CAN", 1), LCD_H - 12, text_w("NO CAN", 1) + 6, 9, DIM);
+        draw_text(LCD_W - 5 - text_w("NO CAN", 1), LCD_H - 11, 1, RED, "NO CAN");
+    }
+}
+
+static void draw_graph(int idx)
+{
+    int n = 0;                                               /* consecutive used slots */
+    while (n < GSER && SCREENS[idx].item[n] > P_NONE && SCREENS[idx].item[n] < NPARAM) n++;
+    if (n == 1) draw_graph1(idx);
+    else if (n > 1) draw_graph_multi(idx, n);
 }
 
 static void draw_menu(void);
