@@ -125,6 +125,7 @@ static bool car_live;                /* false -> no fresh CAN frames */
 static int screen;
 static int bright = 100;             /* backlight, % (persisted in NVS, like the settings below) */
 static int cc_step = 5;              /* km/h per encoder click when adjusting the cruise set point, 1..5 */
+static int g_param, g_span;          /* menu override of the first graph screen: parameter (0 = screens.h), window in s (0 = screens.h) */
 static bool al_on;                   /* AUTO LOCK as on a factory trip computer: GEM "lock at start of movement" (not applied yet) */
 static float trip_m;                 /* metres */
 static uint32_t trip_ms;
@@ -245,6 +246,9 @@ static void settings_load(void)
         if (nvs_get_i8(h, "bright", &v) == ESP_OK) bright = clampi(v, 10, 100);
         if (nvs_get_i8(h, "ccstep", &v) == ESP_OK) cc_step = clampi(v, 1, 5);
         if (nvs_get_i8(h, "lock_on", &v) == ESP_OK) al_on = v != 0;
+        if (nvs_get_i8(h, "g_param", &v) == ESP_OK) g_param = clampi(v, 0, NPARAM - 1);
+        int16_t gs;
+        if (nvs_get_i16(h, "g_span", &gs) == ESP_OK) g_span = clampi(gs, 0, 3600);
         int16_t u;
         if (nvs_get_i16(h, "fuel_ul", &u) == ESP_OK) fuel_ul = clampi(u, 20, 400);
         if (nvs_get_u32(h, "fuel_cnt", &tank_cnt) == ESP_OK) tank_saved = tank_cnt;
@@ -259,6 +263,8 @@ static void settings_save(void)
     nvs_set_i8(h, "bright", (int8_t)bright);
     nvs_set_i8(h, "ccstep", (int8_t)cc_step);
     nvs_set_i8(h, "lock_on", al_on);
+    nvs_set_i8(h, "g_param", (int8_t)g_param);
+    nvs_set_i16(h, "g_span", (int16_t)g_span);
     nvs_set_i16(h, "fuel_ul", (int16_t)fuel_ul);
     nvs_commit(h);
     nvs_close(h);
@@ -604,6 +610,24 @@ static int param_level(int id, int v)                /* 0 ok, 1 warning (amber),
     return 0;
 }
 
+/* the first SK_GRAPH screen can be re-pointed from the menu (item[0] and the window); the rest comes from screens.h */
+static int graph_first(void)
+{
+    for (int i = 0; i < SCREEN_COUNT; i++) if (SCREENS[i].kind == SK_GRAPH) return i;
+    return -1;
+}
+
+static int gitem(int scr, int k)
+{
+    return (k == 0 && g_param && scr == graph_first()) ? g_param : SCREENS[scr].item[k];
+}
+
+static int gspan(int scr)
+{
+    const int s = (g_span && scr == graph_first()) ? g_span : SCREENS[scr].span_s;
+    return s ? s : 60;
+}
+
 /* bit mask over Q_* of the OBD answers the screen needs */
 static uint16_t screen_pid_mask(int scr)
 {
@@ -611,7 +635,7 @@ static uint16_t screen_pid_mask(int scr)
     if (scr < 0 || scr >= SCREEN_COUNT || SCREENS[scr].kind == SK_DRIVE) return 0;
     const int n = SCREENS[scr].kind == SK_GRAPH ? GSER : 6;
     for (int k = 0; k < n; k++) {
-        switch (SCREENS[scr].item[k]) {
+        switch (SCREENS[scr].kind == SK_GRAPH ? gitem(scr, k) : SCREENS[scr].item[k]) {
         case P_IAT:    m |= 1 << Q_IAT; break;
         case P_TIMING: m |= 1 << Q_TIMING; break;
         case P_STFT:   m |= 1 << Q_STFT; break;
@@ -664,9 +688,16 @@ static int16_t hist[SCREEN_COUNT][GSER][HIST_N];   /* rings, newest at hist_head
 static uint16_t hist_head[SCREEN_COUNT];
 static uint32_t hist_acc[SCREEN_COUNT];
 
-static uint32_t graph_period_ms(const screen_cfg_t *sc)
+static uint32_t graph_period_ms(int scr)
 {
-    return (sc->span_s ? sc->span_s : 60) * 1000u / HIST_N;
+    return gspan(scr) * 1000u / HIST_N;
+}
+
+static void graph_clear(int scr)                             /* new parameter or window: the old curve means nothing */
+{
+    for (int j = 0; j < GSER; j++) for (int k = 0; k < HIST_N; k++) hist[scr][j][k] = NO_SAMPLE;
+    hist_head[scr] = 0;
+    hist_acc[scr] = 0;
 }
 
 /* called every frame with the frame time; records the shown parameter of every graph screen */
@@ -679,13 +710,13 @@ static void graph_step(uint32_t dt_ms)
     }
     for (int i = 0; i < SCREEN_COUNT; i++) {
         if (SCREENS[i].kind != SK_GRAPH) continue;
-        const uint32_t per = graph_period_ms(&SCREENS[i]);
+        const uint32_t per = graph_period_ms(i);
         hist_acc[i] += dt_ms;
         while (hist_acc[i] >= per) {
             hist_acc[i] -= per;
             for (int j = 0; j < GSER; j++) {
                 int v;
-                const int id = SCREENS[i].item[j];
+                const int id = gitem(i, j);
                 hist[i][j][hist_head[i]] = (id > P_NONE && id < NPARAM && param_get(id, &v)) ? clampi(v, -32000, 32000) : NO_SAMPLE;
             }
             hist_head[i] = (hist_head[i] + 1) % HIST_N;
@@ -695,8 +726,7 @@ static void graph_step(uint32_t dt_ms)
 
 static void draw_graph1(int idx)
 {
-    const screen_cfg_t *sc = &SCREENS[idx];
-    const int id = sc->item[0];
+    const int id = gitem(idx, 0);
     const int py0 = 4, ph = LCD_H - 8;                       /* plot rows py0 .. py0+ph-1 */
     char b[16] = "--";
     int v = 0, lvl = 0;
@@ -706,7 +736,7 @@ static void draw_graph1(int idx)
     draw_text(4, 12, 1, GRAY, PARAMS[id].label);
     draw_text(4, 26, scale, lvl == 2 ? RED : lvl == 1 ? AMBER : WHITE, b);
     char sp[12];
-    snprintf(sp, sizeof(sp), "%ds", sc->span_s ? sc->span_s : 60);
+    snprintf(sp, sizeof(sp), "%ds", gspan(idx));
     draw_text(4, LCD_H - 12, 1, GRAY, sp);
 
     int lo = INT_MAX, hi = INT_MIN;                          /* range of the window */
@@ -756,11 +786,10 @@ static void draw_graph1(int idx)
 /* 2..3 parameters on one plot: each line is scaled to its own min..max (different units), colour = series */
 static void draw_graph_multi(int idx, int n)
 {
-    const screen_cfg_t *sc = &SCREENS[idx];
     const uint16_t col[GSER] = { WHITE, SER_B, SER_C };
     const int py0 = 4, ph = LCD_H - 8, row = LCD_H / n;
     for (int j = 0; j < n; j++) {                            /* left column: label + current value per series */
-        const int id = sc->item[j];
+        const int id = gitem(idx, j);
         char b[16] = "--";
         int v = 0, lvl = 0;
         if (param_get(id, &v)) { param_text(id, v, b, sizeof(b)); lvl = param_level(id, v); }
@@ -772,7 +801,7 @@ static void draw_graph_multi(int idx, int n)
     fill_rect(PLOT_X - 4, py0, 1, ph, DIM);
     fill_rect(PLOT_X - 4, py0 + ph, LCD_W - PLOT_X, 1, DIM);
     for (int j = 0; j < n; j++) {
-        const int id = sc->item[j];
+        const int id = gitem(idx, j);
         int lo = INT_MAX, hi = INT_MIN;
         for (int i = 0; i < HIST_N; i++) {
             const int s = hist[idx][j][i];
@@ -794,7 +823,7 @@ static void draw_graph_multi(int idx, int n)
         }
     }
     char sp[12];
-    snprintf(sp, sizeof(sp), "%ds", sc->span_s ? sc->span_s : 60);
+    snprintf(sp, sizeof(sp), "%ds", gspan(idx));
     fill_rect(LCD_W - 6 - text_w(sp, 1), 2, text_w(sp, 1) + 4, 9, DIM);      /* label over the lines */
     draw_text(LCD_W - 4 - text_w(sp, 1), 3, 1, GRAY, sp);
     if (!car_live) {
@@ -806,7 +835,7 @@ static void draw_graph_multi(int idx, int n)
 static void draw_graph(int idx)
 {
     int n = 0;                                               /* consecutive used slots */
-    while (n < GSER && SCREENS[idx].item[n] > P_NONE && SCREENS[idx].item[n] < NPARAM) n++;
+    while (n < GSER && gitem(idx, n) > P_NONE && gitem(idx, n) < NPARAM) n++;
     if (n == 1) draw_graph1(idx);
     else if (n > 1) draw_graph_multi(idx, n);
 }
@@ -940,10 +969,13 @@ static void IRAM_ATTR dump_push_isr(char bus, uint32_t id, const uint8_t *d, int
 }
 
 /* settings menu: turn = move (or change the value in edit mode), press = select/confirm, hold = back to DRIVE */
-enum { MI_BRIGHT, MI_CC_STEP, MI_AUTOLOCK, MI_FUEL_CAL, MI_TANK, MI_TRIP_RESET, MI_DUMP, MI_EXIT, NMENU };
+enum { MI_BRIGHT, MI_CC_STEP, MI_AUTOLOCK, MI_GRAPH_PARAM, MI_GRAPH_SPAN, MI_FUEL_CAL, MI_TANK, MI_TRIP_RESET, MI_DUMP, MI_EXIT, NMENU };
 #define MENU_ROWS 4
 static int menu_sel, menu_top;
 static bool menu_edit;
+
+static const int SPANS[] = { 0, 30, 60, 120, 300, 600 };   /* GR SPAN choices, s (0 = as in screens.h) */
+#define NSPAN ((int)(sizeof(SPANS) / sizeof(SPANS[0])))
 
 static void menu_leave(void)
 {
@@ -959,6 +991,14 @@ static void menu_rotate(int steps)
         if (menu_sel == MI_BRIGHT) { bright = clampi(bright + 10 * steps, 10, 100); backlight_set(bright); }
         else if (menu_sel == MI_CC_STEP) cc_step = clampi(cc_step + steps, 1, 5);
         else if (menu_sel == MI_FUEL_CAL) fuel_ul = clampi(fuel_ul + 5 * steps, 20, 400);
+        else if (menu_sel == MI_GRAPH_PARAM) { g_param = ((g_param + steps) % NPARAM + NPARAM) % NPARAM; graph_clear(graph_first()); }
+        else if (menu_sel == MI_GRAPH_SPAN) {
+            int i = 0;                                   /* position in the list, 0 = from screens.h */
+            while (i < NSPAN && SPANS[i] != g_span) i++;
+            i = i < NSPAN ? i : 0;
+            g_span = SPANS[((i + steps) % NSPAN + NSPAN) % NSPAN];
+            graph_clear(graph_first());
+        }
     } else {
         menu_sel = ((menu_sel + steps) % NMENU + NMENU) % NMENU;
         if (menu_sel < menu_top) menu_top = menu_sel;
@@ -972,6 +1012,9 @@ static void menu_press(void)
     case MI_BRIGHT:
     case MI_CC_STEP:
     case MI_FUEL_CAL:
+    case MI_GRAPH_PARAM:
+    case MI_GRAPH_SPAN:
+        if (graph_first() < 0 && (menu_sel == MI_GRAPH_PARAM || menu_sel == MI_GRAPH_SPAN)) break;   /* no graph screen */
         if (menu_edit) settings_save();
         menu_edit = !menu_edit;
         break;
@@ -999,7 +1042,7 @@ static void menu_press(void)
 
 static void draw_menu(void)
 {
-    static const char *const label[NMENU] = { "BRIGHT", "CC STEP", "AUTO LOCK", "FUEL CAL", "TANK L", "TRIP RESET", "CAN DUMP", "EXIT" };
+    static const char *const label[NMENU] = { "BRIGHT", "CC STEP", "AUTO LOCK", "GR PARAM", "GR SPAN", "FUEL CAL", "TANK L", "TRIP RESET", "CAN DUMP", "EXIT" };
     char v[24];
     for (int r = 0; r < MENU_ROWS; r++) {
         const int i = menu_top + r;
@@ -1011,6 +1054,8 @@ static void draw_menu(void)
         if (i == MI_BRIGHT) snprintf(v, sizeof(v), "%d%%", bright);
         else if (i == MI_CC_STEP) snprintf(v, sizeof(v), "%d", cc_step);
         else if (i == MI_AUTOLOCK) snprintf(v, sizeof(v), "%s", al_on ? "ON" : "OFF");
+        else if (i == MI_GRAPH_PARAM) snprintf(v, sizeof(v), "%s", graph_first() < 0 ? "-" : g_param ? PARAMS[g_param].label : "CFG");
+        else if (i == MI_GRAPH_SPAN) { if (graph_first() < 0) snprintf(v, sizeof(v), "-"); else if (g_span) snprintf(v, sizeof(v), "%ds", g_span); else snprintf(v, sizeof(v), "CFG"); }
         else if (i == MI_FUEL_CAL) snprintf(v, sizeof(v), "%d.%03d", fuel_ul / 1000, fuel_ul % 1000);
         else if (i == MI_TANK) { const int t10 = (int)(tank_cnt * fuel_ul * 1e-5f); snprintf(v, sizeof(v), "%d.%d", t10 / 10, t10 % 10); }
         else if (i == MI_DUMP) snprintf(v, sizeof(v), "%s", dump_on ? "ON" : "OFF");
