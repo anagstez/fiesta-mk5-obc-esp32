@@ -139,6 +139,8 @@ static volatile bool fuel_seen;
 static uint8_t fuel_prev;                                /* ISR only */
 static int fuel_ul = 100;
 static uint32_t fuel_last, trip_fuel, tank_cnt, tank_saved;
+static struct { uint32_t steps, m; } eco_map[ECO_GEARS][ECO_L_SPEEDS];   /* learned consumption, see eco.h */
+static bool eco_map_dirty;
 static float flow_ml_s;
 static int max_speed, max_rpm;
 static volatile TickType_t last_speed;   /* tick of the last 0x201 frame (speed source) */
@@ -259,6 +261,8 @@ static void settings_load(void)
         int16_t u;
         if (nvs_get_i16(h, "fuel_ul", &u) == ESP_OK) fuel_ul = clampi(u, 20, 400);
         if (nvs_get_u32(h, "fuel_cnt", &tank_cnt) == ESP_OK) tank_saved = tank_cnt;
+        size_t ml = sizeof(eco_map);
+        if (nvs_get_blob(h, "eco_map", eco_map, &ml) != ESP_OK || ml != sizeof(eco_map)) memset(eco_map, 0, sizeof(eco_map));
         nvs_close(h);
     }
 }
@@ -285,6 +289,16 @@ static void fuel_save(void)
     nvs_commit(h);
     nvs_close(h);
     tank_saved = tank_cnt;
+}
+
+static void eco_map_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("obc", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_blob(h, "eco_map", eco_map, sizeof(eco_map));
+    nvs_commit(h);
+    nvs_close(h);
+    eco_map_dirty = false;
 }
 
 static void lcd_init(void)
@@ -874,6 +888,60 @@ static void eco_step(uint32_t dt_ms)                 /* per frame: debounce the 
     eco_idle_ms = (car_live && car.speed < 2 && car.rpm > 500) ? eco_idle_ms + dt_ms : 0;
 }
 
+static int eco_bin(int spd) { return clampi((spd - ECO_L_V0) / 10, 0, ECO_L_SPEEDS - 1); }
+
+/* steps per km of a trusted cell, 0 = not enough data yet */
+static int eco_cost(int gear, int spd)
+{
+    if (gear < 1 || gear > ECO_GEARS || spd < ECO_L_V0) return 0;
+    const typeof(eco_map[0][0]) *c = &eco_map[gear - 1][eco_bin(spd)];
+    return c->m >= ECO_L_MIN_M ? (int)((uint64_t)c->steps * 1000 / c->m) : 0;
+}
+
+static void eco_learn(uint32_t dc, uint32_t dt_ms, int spd, int gas)   /* per frame: dc = fuel counter steps in dt_ms */
+{
+    static uint32_t win_ms, win_steps;
+    static float win_m;
+    static int win_gear, v0, gas_min;
+    if (!car_live || !eco_gear || spd < ECO_L_V0) { win_ms = win_steps = 0; win_m = 0; win_gear = 0; return; }
+    if (win_ms == 0) { win_gear = eco_gear; v0 = spd; gas_min = 100; }
+    if (eco_gear != win_gear) { win_ms = win_steps = 0; win_m = 0; return; }
+    win_ms += dt_ms;
+    win_steps += dc;
+    win_m += spd * (dt_ms / 3.6e6f) * 1000.0f;
+    if (gas < gas_min) gas_min = gas;
+    if (win_ms < 1000) return;
+    if (abs(spd - v0) <= ECO_L_STEADY && gas_min > 1) {
+        typeof(eco_map[0][0]) *c = &eco_map[win_gear - 1][eco_bin(spd)];
+        c->steps += win_steps;
+        c->m += (uint32_t)(win_m + 0.5f);
+        eco_map_dirty = true;
+    }
+    win_ms = win_steps = 0; win_m = 0;
+    static uint32_t save_ms;
+    if ((save_ms += 1000) >= ECO_L_SAVE_MS) { save_ms = 0; if (eco_map_dirty) eco_map_save(); }
+}
+
+/* +1 = a higher gear is learned to be cheaper by >= ECO_L_SAVE %, -1 = a lower one, 0 = none / no data; *pct = saving */
+static int eco_learned_advice(int gear, int spd, int *pct)
+{
+    const int cur = eco_cost(gear, spd);
+    if (!cur) return 0;
+    int best = 0, bp = 0;
+    for (int d = -1; d <= 1; d += 2) {
+        const int g = gear + d;
+        if (g < 1 || g > ECO_GEARS) continue;
+        const float rpm = spd * ECO_RATIO[g - 1];
+        if (rpm < ECO_RPM_NEXT_MIN || rpm > ECO_RPM_UP) continue;       /* the target gear must itself be sensible */
+        const int c = eco_cost(g, spd);
+        if (!c) continue;
+        const int p = (cur - c) * 100 / cur;
+        if (p >= ECO_L_SAVE && p > bp) { bp = p; best = d; }
+    }
+    *pct = bp;
+    return best;
+}
+
 static void draw_arrow(int x, int y, int w, int h, bool up, uint16_t c)
 {
     const int head = h * 55 / 100, sw = w / 3;
@@ -912,8 +980,15 @@ static void draw_eco(void)
         adv = A_DOWN;
         snprintf(reason, sizeof(reason), "RPM %d TOO LOW", rpm);
     } else {
-        adv = A_OK;
-        snprintf(reason, sizeof(reason), "RPM %d OK", rpm);
+        int pct = 0;
+        const int la = eco_learned_advice(g, spd, &pct);
+        if (la) {
+            adv = la > 0 ? A_UP : A_DOWN;
+            snprintf(reason, sizeof(reason), "SAVES %d%%", pct);
+        } else {
+            adv = A_OK;
+            snprintf(reason, sizeof(reason), eco_cost(g, spd) ? "RPM %d BEST" : "RPM %d OK", rpm);
+        }
     }
     static const char *const word[] = { "", "OK", "UP", "DOWN", "COAST", "EASY", "SLOW", "IDLE", "OFF", "CLUTCH" };
     const uint16_t col = adv == A_COAST ? GREEN_ON : (adv == A_UP || adv == A_DOWN || adv == A_EASY || adv == A_SLOW || adv == A_OFF) ? AMBER : WHITE;
@@ -1069,6 +1144,7 @@ static void car_step(uint32_t dt_ms)
         flow_ml_s = 0;
         car.flow10 = -1;
     }
+    eco_learn(dc, dt_ms, car_live && fuel_seen ? car.speed : 0, car.gas);   /* no fuel counter: nothing to learn */
     trip_ms += dt_ms;
     trip_m  += car.speed * (dt_ms / 3.6e6f) * 1000.0f;
     if (car.speed > max_speed) max_speed = car.speed;
@@ -1142,7 +1218,7 @@ static void IRAM_ATTR dump_push_isr(char bus, uint32_t id, const uint8_t *d, int
 }
 
 /* settings menu: turn = move (or change the value in edit mode), press = select/confirm, hold = back to DRIVE */
-enum { MI_BRIGHT, MI_AUTOLOCK, MI_GRAPH_PARAM, MI_GRAPH_SPAN, MI_FUEL_CAL, MI_TANK, MI_TRIP_RESET, MI_DUMP, MI_EXIT, NMENU };
+enum { MI_BRIGHT, MI_AUTOLOCK, MI_GRAPH_PARAM, MI_GRAPH_SPAN, MI_FUEL_CAL, MI_TANK, MI_TRIP_RESET, MI_ECO_RESET, MI_DUMP, MI_EXIT, NMENU };
 #define MENU_ROWS 4
 static int menu_sel, menu_top;
 static bool menu_edit;
@@ -1202,6 +1278,11 @@ static void menu_press(void)
         trip_m = 0; trip_ms = 0; max_speed = 0; max_rpm = 0;
         ESP_LOGI(TAG, "trip reset");
         break;
+    case MI_ECO_RESET:
+        memset(eco_map, 0, sizeof(eco_map));
+        eco_map_save();
+        ESP_LOGI(TAG, "eco map reset");
+        break;
     case MI_DUMP:
         dump_on = !dump_on;
         break;
@@ -1213,7 +1294,7 @@ static void menu_press(void)
 
 static void draw_menu(void)
 {
-    static const char *const label[NMENU] = { "BRIGHT", "AUTO LOCK", "GR PARAM", "GR SPAN", "FUEL CAL", "TANK L", "TRIP RESET", "CAN DUMP", "EXIT" };
+    static const char *const label[NMENU] = { "BRIGHT", "AUTO LOCK", "GR PARAM", "GR SPAN", "FUEL CAL", "TANK L", "TRIP RESET", "ECO RESET", "CAN DUMP", "EXIT" };
     char v[24];
     for (int r = 0; r < MENU_ROWS; r++) {
         const int i = menu_top + r;
@@ -1730,6 +1811,11 @@ void app_main(void)
                 else if (line[0] == '+') cruise_adjust(cc_step);
                 else if (line[0] == '-') cruise_adjust(-cc_step);
                 else if ((line[0] == 'G' || line[0] == 'W' || line[0] == 'E') && !gem_busy) { gem_busy = true; xTaskCreate(gem_task, "gem", 5120, (void *)(intptr_t)(line[0] == 'W' ? 1 : line[0] == 'E' ? 2 : 0), 4, NULL); }
+                else if (line[0] == 'L') {
+                    for (int g = 0; g < ECO_GEARS; g++)
+                        for (int b = 0; b < ECO_L_SPEEDS; b++)
+                            if (eco_map[g][b].m) ESP_LOGI(TAG, "eco g%d v%d+ %lu m %lu steps %d steps/km", g + 1, ECO_L_V0 + 10 * b, (unsigned long)eco_map[g][b].m, (unsigned long)eco_map[g][b].steps, eco_cost(g + 1, ECO_L_V0 + 10 * b));
+                }
                 else if (line[0] == 'D') {
                     dump_on = !dump_on;
                     ESP_LOGI(TAG, "dump %s", dump_on ? "ON (M=MS-CAN, H=HS-CAN, changes only)" : "OFF");

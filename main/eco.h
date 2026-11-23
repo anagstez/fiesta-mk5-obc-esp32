@@ -21,3 +21,16 @@ static const float ECO_RATIO[ECO_GEARS] = { 137.0f, 73.5f, 49.0f, 36.3f, 29.0f }
 #define ECO_GAS_HEAVY    75      /* pedal above this: "EASY" (full-load enrichment burns fuel) */
 #define ECO_SLOW_KMH     110     /* above this: "SLOW" */
 #define ECO_IDLE_STOP_MS 30000   /* idling this long: advise to switch the engine off */
+
+/*
+ * Learned consumption map: while driving, the board adds up fuel counter steps and metres per (gear, speed bin) for
+ * steady driving only (speed change over a 1 s window <= ECO_L_STEADY km/h, pedal not released, gear known), keeps
+ * the sums in NVS and, once both the current and a neighbouring gear have ECO_L_MIN_M metres at this speed, advises
+ * the cheaper one. Sums are in counter steps, so the advice does not depend on the FUEL CAL value.
+ */
+#define ECO_L_SPEEDS  10         /* bins of 10 km/h starting at ECO_L_V0 (the last one is open-ended) */
+#define ECO_L_V0      20
+#define ECO_L_STEADY  2
+#define ECO_L_MIN_M   300        /* metres needed in a cell before it is trusted */
+#define ECO_L_SAVE    8          /* advise a shift when it saves at least this many percent */
+#define ECO_L_SAVE_MS 120000     /* write the map to NVS this often (only when changed) */
