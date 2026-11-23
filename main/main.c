@@ -28,6 +28,7 @@
 #include "nvs.h"
 #include "mcp2515.h"
 #include "car_icons.h"
+#include "screens.h"
 
 #define ICON_W 76
 #define ICON_H 52
@@ -74,8 +75,10 @@ static const char *TAG = "obc";
 #define RPM_SEGS  16
 #define RPM_MAX   7000
 
-enum { SCR_DRIVE, SCR_TRIP, SCR_FUEL, SCR_ENG, SCR_ENG2, SCR_MENU, NSCREEN };
-#define NCYCLE    SCR_MENU           /* screens in the turn cycle; the menu is entered by a 5 s hold */
+#define SCREEN_COUNT ((int)(sizeof(SCREENS) / sizeof(SCREENS[0])))   /* screens.h */
+#define SCR_DRIVE 0                  /* SCREENS[0] */
+#define SCR_MENU  SCREEN_COUNT       /* after the configured screens, entered by a 5 s hold */
+#define NCYCLE    SCREEN_COUNT       /* screens in the turn cycle */
 #define LONG_MS   700                /* hold in the menu: back to DRIVE */
 #define MENU_MS   5000               /* hold: open the settings menu */
 
@@ -109,8 +112,10 @@ typedef struct {
 
 static car_t car;                    /* written from the TWAI rx ISR when live */
 
-/* PCM values that exist only as OBD-II answers (nothing broadcasts them); no source is wired up yet, so they stay stale = "--" */
-typedef struct { int iat, timing2, stft10, ltft10, o2_mv, load, ect, thr, o2b_mv, fsys, dtc; bool mil; TickType_t t; } obd_t;
+/* PCM values that exist only as OBD-II answers (nothing broadcasts them); each has its own timestamp, stale = "--" */
+enum { Q_IAT, Q_TIMING, Q_STFT, Q_LTFT, Q_O2A, Q_LOAD, Q_ECT, Q_THR, Q_O2B, Q_FSYS, Q_DTC, NQ };
+static const uint8_t obd_pids[NQ] = { 0x0F, 0x0E, 0x06, 0x07, 0x14, 0x04, 0x05, 0x11, 0x15, 0x03, 0x01 };
+typedef struct { int val[NQ]; TickType_t ts[NQ]; } obd_t;
 static volatile obd_t obd;
 #define OBD_FRESH_MS 3000
 static volatile bool can_seen;
@@ -518,98 +523,132 @@ static void draw_drive(void)
     }
 }
 
-/* page 0: trip stats (3 x 2), page 1: fuel + voltage (3 x 1, larger) */
-static void draw_trip(int page)
+/* ---- configurable screens (layout in screens.h) ---- */
+
+static const uint8_t param_dec[NPARAM] = {          /* decimals of the raw value, see the units in screens.h */
+    [P_VOLT] = 1, [P_TRIP_KM] = 1, [P_FUEL_L] = 1, [P_L100] = 1, [P_LEFT_L] = 1, [P_LPH] = 1, [P_L100I] = 1,
+    [P_TIMING] = 1, [P_STFT] = 1, [P_LTFT] = 1, [P_TRIM] = 1, [P_O2A] = 2, [P_O2B] = 2,
+};
+
+static bool obd_get(int q, int *v)
 {
-    const float km = trip_m / 1000.0f;
-    const float hours = trip_ms / 3.6e6f;
-    const int avg_kmh = hours > 0.0005f ? (int)(km / hours) : 0;
-    const int secs = (int)(trip_ms / 1000);
-    const float litres = trip_fuel * fuel_ul * 1e-6f;
-    const int l10 = (int)(litres * 10);
-
-    static const char *const label[9] = { "TRIP KM", "TIME", "AVG KM/H", "MAX KM/H", "MAX RPM", "CLOCK", "FUEL L", "L/100", "LEFT L" };
-    char vals[9][16];
-    snprintf(vals[0], sizeof(vals[0]), "%d.%d", (int)km, (int)(km * 10) % 10);
-    snprintf(vals[1], sizeof(vals[1]), "%d:%02d", secs / 3600, secs / 60 % 60);
-    snprintf(vals[2], sizeof(vals[2]), "%d", avg_kmh);
-    snprintf(vals[3], sizeof(vals[3]), "%d", max_speed);
-    snprintf(vals[4], sizeof(vals[4]), "%d", max_rpm);
-    snprintf(vals[5], sizeof(vals[5]), "%02d:%02d", car.hh, car.mm);
-    snprintf(vals[6], sizeof(vals[6]), "%d.%d", l10 / 10, l10 % 10);
-    if (km >= 0.3f && litres > 0) {
-        const int c10 = (int)(litres / km * 1000);       /* 0.1 L/100 km */
-        snprintf(vals[7], sizeof(vals[7]), "%d.%d", c10 / 10, c10 % 10);
-    } else {
-        snprintf(vals[7], sizeof(vals[7]), "--");
-    }
-    if (car.fuel_lvl > 0) {                              /* 0x499: ~15.2 units/L, zero point assumed at 0 (one calibration point) */
-        const int t10 = car.fuel_lvl * 100 / 152;
-        snprintf(vals[8], sizeof(vals[8]), "%d.%d", t10 / 10, t10 % 10);
-    } else {
-        snprintf(vals[8], sizeof(vals[8]), "--");
-    }
-
-    const int first = page ? 6 : 0, n = page ? 3 : 6, rows = page ? 1 : 2;
-    const int cell_h = LCD_H / rows;
-    for (int k = 0; k < n; k++) {
-        const int i = first + k;
-        const int x = 4 + (k % 3) * 94;
-        const int y = (k / 3) * cell_h;
-        int sc = page ? 4 : 3;
-        if (text_w(vals[i], sc) > 86) sc--;              /* long trip distance still has to fit its column */
-        const int lh = 7, vh = 7 * sc, top = y + (cell_h - (lh + 4 + vh)) / 2;
-        draw_text(x, top, 1, GRAY, label[i]);
-        draw_text(x, top + lh + 4, sc, WHITE, vals[i]);
-    }
-    fill_rect(93, 2, 1, 72, DIM);
-    fill_rect(187, 2, 1, 72, DIM);
-    if (!page) fill_rect(4, 38, 276, 1, DIM);
-    if (!car_live) draw_text(LCD_W - 4 - text_w("NO CAN", 1), 2, 1, RED, "NO CAN");
+    const TickType_t t = obd.ts[q];
+    if (!t || xTaskGetTickCount() - t >= pdMS_TO_TICKS(OBD_FRESH_MS)) return false;
+    *v = obd.val[q];
+    return true;
 }
 
-/* engine data: MAP comes from MS-CAN, the rest from OBD answers (see obd_t) */
-static void draw_engine(int page)
+/* current value of a parameter in its raw unit; false = no data (shown as "--") */
+static bool param_get(int id, int *v)
 {
-    static const char *const label[2][6] = {
-        { "MAP KPA", "IAT C", "TIMING", "STFT %", "LTFT %", "O2 B1S1 V" },
-        { "LOAD %", "ECT C", "THR %", "O2 B1S2 V", "FUEL SYS", "DTC" } };
-    char vals[6][16];
-    const bool fresh = obd.t && (xTaskGetTickCount() - obd.t) < pdMS_TO_TICKS(OBD_FRESH_MS);
-    if (page) {
-        for (int i = 0; i < 6; i++) snprintf(vals[i], sizeof(vals[i]), "--");
-        if (fresh) {
-            snprintf(vals[0], sizeof(vals[0]), "%d", obd.load);
-            snprintf(vals[1], sizeof(vals[1]), "%d", obd.ect);
-            snprintf(vals[2], sizeof(vals[2]), "%d", obd.thr);
-            snprintf(vals[3], sizeof(vals[3]), "%d.%02d", obd.o2b_mv / 1000, obd.o2b_mv % 1000 / 10);
-            snprintf(vals[4], sizeof(vals[4]), "%s", (obd.fsys & 0x12) ? "CL" : "OL");   /* 02/10 = closed loop */
-            if (obd.mil) snprintf(vals[5], sizeof(vals[5]), "%d MIL", obd.dtc);
-            else snprintf(vals[5], sizeof(vals[5]), "%d", obd.dtc);
+    const float km = trip_m / 1000.0f, hours = trip_ms / 3.6e6f, litres = trip_fuel * fuel_ul * 1e-6f;
+    int a, b;
+    switch (id) {
+    case P_SPEED:     *v = car.speed;   return car_live;
+    case P_RPM:       *v = car.rpm;     return car_live;
+    case P_COOL:      *v = car.cool;    return car_live;
+    case P_VOLT:      *v = car.volt10;  return car_live;
+    case P_GAS:       *v = car.gas;     return car_live;
+    case P_TRIP_KM:   *v = (int)(km * 10); return true;
+    case P_TRIP_TIME: *v = (int)(trip_ms / 1000); return true;
+    case P_AVG:       *v = hours > 0.0005f ? (int)(km / hours) : 0; return true;
+    case P_MAX_SPEED: *v = max_speed;   return true;
+    case P_MAX_RPM:   *v = max_rpm;     return true;
+    case P_CLOCK:     *v = car.hh * 60 + car.mm; return true;
+    case P_FUEL_L:    *v = (int)(litres * 10); return true;
+    case P_L100:      *v = (int)(litres / km * 1000); return km >= 0.3f && litres > 0;
+    case P_LEFT_L:    *v = car.fuel_lvl * 100 / 152; return car_live && car.fuel_lvl > 0;   /* ~15.2 units/L */
+    case P_LPH:       *v = car.flow10;  return car_live && car.flow10 >= 0;
+    case P_L100I:     *v = car.speed > 0 ? car.flow10 * 100 / car.speed : 0; return car_live && car.flow10 >= 0 && car.speed >= 10;
+    case P_MAP:       *v = car.map;     return car_live;
+    case P_IAT:       return obd_get(Q_IAT, v);
+    case P_TIMING:    if (!obd_get(Q_TIMING, &a)) return false; *v = a * 5; return true;   /* half degrees -> 0.1 */
+    case P_STFT:      return obd_get(Q_STFT, v);
+    case P_LTFT:      return obd_get(Q_LTFT, v);
+    case P_TRIM:      if (!obd_get(Q_STFT, &a) || !obd_get(Q_LTFT, &b)) return false; *v = a + b; return true;
+    case P_O2A:       if (!obd_get(Q_O2A, &a)) return false; *v = a / 10; return true;      /* mV -> 0.01 V */
+    case P_O2B:       if (!obd_get(Q_O2B, &a)) return false; *v = a / 10; return true;
+    case P_LOAD:      return obd_get(Q_LOAD, v);
+    case P_ECT:       return obd_get(Q_ECT, v);
+    case P_THR:       return obd_get(Q_THR, v);
+    case P_FSYS:      return obd_get(Q_FSYS, v);
+    case P_DTC:       return obd_get(Q_DTC, v);
+    default:          return false;
+    }
+}
+
+static void param_text(int id, int v, char *b, size_t n)
+{
+    switch (id) {
+    case P_TRIP_TIME: snprintf(b, n, "%d:%02d", v / 3600, v / 60 % 60); return;
+    case P_CLOCK:     snprintf(b, n, "%02d:%02d", v / 60, v % 60); return;
+    case P_FSYS:      snprintf(b, n, "%s", (v & 0x12) ? "CL" : "OL"); return;   /* 02/10 = closed loop */
+    case P_DTC:       if (v & 0x100) snprintf(b, n, "%d MIL", v & 0x7F); else snprintf(b, n, "%d", v & 0x7F); return;
+    default: break;
+    }
+    const int dec = param_dec[id];
+    if (!dec) { snprintf(b, n, "%d", v); return; }
+    const int p = dec == 1 ? 10 : 100, a = v < 0 ? -v : v;
+    snprintf(b, n, "%s%d.%0*d", v < 0 ? "-" : "", a / p, dec, a % p);
+}
+
+static int param_level(int id, int v)                /* 0 ok, 1 warning (amber), 2 alarm (red) */
+{
+    const param_cfg_t *c = &PARAMS[id];
+    if (id == P_DTC) v &= 0x7F;
+    if (v < c->alarm_lo || v > c->alarm_hi) return 2;
+    if (v < c->warn_lo || v > c->warn_hi) return 1;
+    return 0;
+}
+
+/* bit mask over Q_* of the OBD answers the screen needs */
+static uint16_t screen_pid_mask(int scr)
+{
+    uint16_t m = 0;
+    if (scr < 0 || scr >= SCREEN_COUNT || SCREENS[scr].kind != SK_GRID) return 0;
+    for (int k = 0; k < 6; k++) {
+        switch (SCREENS[scr].item[k]) {
+        case P_IAT:    m |= 1 << Q_IAT; break;
+        case P_TIMING: m |= 1 << Q_TIMING; break;
+        case P_STFT:   m |= 1 << Q_STFT; break;
+        case P_LTFT:   m |= 1 << Q_LTFT; break;
+        case P_TRIM:   m |= 1 << Q_STFT | 1 << Q_LTFT; break;
+        case P_O2A:    m |= 1 << Q_O2A; break;
+        case P_O2B:    m |= 1 << Q_O2B; break;
+        case P_LOAD:   m |= 1 << Q_LOAD; break;
+        case P_ECT:    m |= 1 << Q_ECT; break;
+        case P_THR:    m |= 1 << Q_THR; break;
+        case P_FSYS:   m |= 1 << Q_FSYS; break;
+        case P_DTC:    m |= 1 << Q_DTC; break;
+        default: break;
         }
-    } else if (car_live) snprintf(vals[0], sizeof(vals[0]), "%d", car.map);
-    else snprintf(vals[0], sizeof(vals[0]), "--");
-    if (!page && fresh) {
-        const int tm = obd.timing2, st = obd.stft10, lt = obd.ltft10, o2 = obd.o2_mv;
-        snprintf(vals[1], sizeof(vals[1]), "%d", obd.iat);
-        snprintf(vals[2], sizeof(vals[2]), "%d.%d", tm / 2, (tm < 0 ? -tm : tm) % 2 * 5);
-        snprintf(vals[3], sizeof(vals[3]), "%d.%d", st / 10, (st < 0 ? -st : st) % 10);
-        snprintf(vals[4], sizeof(vals[4]), "%d.%d", lt / 10, (lt < 0 ? -lt : lt) % 10);
-        snprintf(vals[5], sizeof(vals[5]), "%d.%02d", o2 / 1000, o2 % 1000 / 10);
-    } else if (!page) {
-        for (int i = 1; i < 6; i++) snprintf(vals[i], sizeof(vals[i]), "--");
     }
-    for (int i = 0; i < 6; i++) {
-        const int x = 4 + (i % 3) * 94, y = (i / 3) * (LCD_H / 2);
-        int sc = 3;
-        if (text_w(vals[i], sc) > 86) sc--;
-        const int lh = 7, vh = 7 * sc, top = y + (LCD_H / 2 - (lh + 4 + vh)) / 2;
-        draw_text(x, top, 1, GRAY, label[page][i]);
-        draw_text(x, top + lh + 4, sc, WHITE, vals[i]);
+    return m;
+}
+
+static void draw_grid(const screen_cfg_t *sc)
+{
+    int cols = sc->cols ? sc->cols : 3, rows = sc->rows ? sc->rows : 1;
+    while (cols * rows > 6) rows--;
+    const int cell_w = LCD_W / cols, cell_h = LCD_H / rows;
+    for (int k = 0; k < cols * rows; k++) {
+        const int id = sc->item[k];
+        if (id <= P_NONE || id >= NPARAM) continue;
+        const int x = 4 + (k % cols) * cell_w, y = (k / cols) * cell_h;
+        char b[16] = "--";
+        int v = 0, lvl = 0;
+        if (param_get(id, &v)) {
+            param_text(id, v, b, sizeof(b));
+            lvl = param_level(id, v);
+        }
+        int scale = sc->max_scale ? sc->max_scale : 3;
+        while (scale > 1 && (text_w(b, scale) > cell_w - 8 || 7 + 4 + 7 * scale > cell_h - 2)) scale--;   /* must fit its cell */
+        const int top = y + (cell_h - (7 + 4 + 7 * scale)) / 2;
+        draw_text(x, top, 1, GRAY, PARAMS[id].label);
+        draw_text(x, top + 7 + 4, scale, lvl == 2 ? RED : lvl == 1 ? AMBER : WHITE, b);
     }
-    fill_rect(93, 2, 1, 72, DIM);
-    fill_rect(187, 2, 1, 72, DIM);
-    fill_rect(4, 38, 276, 1, DIM);
+    for (int i = 1; i < cols; i++) fill_rect(i * cell_w - 1, 2, 1, LCD_H - 4, DIM);
+    for (int i = 1; i < rows; i++) fill_rect(4, i * cell_h, LCD_W - 8, 1, DIM);
     if (!car_live) draw_text(LCD_W - 4 - text_w("NO CAN", 1), 2, 1, RED, "NO CAN");
 }
 
@@ -639,12 +678,9 @@ static void render(void)
         for (int x = 0; x < LCD_W; x++) fb[y * LCD_W + x] = c;
     }
 
-    if (screen == SCR_DRIVE)     draw_drive();
-    else if (screen == SCR_TRIP) draw_trip(0);
-    else if (screen == SCR_FUEL) draw_trip(1);
-    else if (screen == SCR_ENG)  draw_engine(0);
-    else if (screen == SCR_ENG2) draw_engine(1);
-    else                         draw_menu();
+    if (screen >= SCREEN_COUNT)                   draw_menu();
+    else if (SCREENS[screen].kind == SK_GRID)     draw_grid(&SCREENS[screen]);
+    else                                          draw_drive();
 
     if (fb_dump) { fb_dump = false; fb_print(); }
     ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_W, LCD_H, fb));
@@ -754,6 +790,7 @@ static void menu_leave(void)
     if (menu_edit) settings_save();
     menu_edit = false;
     screen = SCR_DRIVE;
+    if (SCREENS[0].kind != SK_DRIVE) ESP_LOGE(TAG, "screens.h: SCREENS[0] must be the DRIVE screen");
 }
 
 static void menu_rotate(int steps)
@@ -902,8 +939,7 @@ static void hs_task(void *arg)
     }
     uint32_t frames = 0, last_log = 0;
     mcp_frame_t f;
-    /* OBD-II Mode 01 read-only polling (functional request 0x7DF, PCM answers 0x7E8); only while the ENG screen is shown */
-    static const uint8_t pids[] = { 0x0F, 0x0E, 0x06, 0x07, 0x14, 0x04, 0x05, 0x11, 0x15, 0x03, 0x01 };
+    /* OBD-II Mode 01 read-only polling (functional request 0x7DF, PCM answers 0x7E8); only the PIDs of the screen shown */
     size_t pid_i = 0;
     TickType_t next_req = 0;
     int unanswered = 0;
@@ -911,10 +947,12 @@ static void hs_task(void *arg)
     while (1) {
         xSemaphoreTake(mcp2515_rx_sem(), pdMS_TO_TICKS(50));
         const TickType_t tn = xTaskGetTickCount();
-        if ((screen == SCR_ENG || screen == SCR_ENG2) && car_live && (int32_t)(tn - next_req) >= 0) {
-            const uint8_t rq[8] = { 0x02, 0x01, pids[pid_i], 0, 0, 0, 0, 0 };
+        const uint16_t need = screen_pid_mask(screen);
+        if (need && car_live && (int32_t)(tn - next_req) >= 0) {
+            for (int t = 0; t < NQ && !(need >> pid_i & 1); t++) pid_i = (pid_i + 1) % NQ;
+            const uint8_t rq[8] = { 0x02, 0x01, obd_pids[pid_i], 0, 0, 0, 0, 0 };
             if (mcp2515_send(0x7DF, rq, 8)) {
-                pid_i = (pid_i + 1) % sizeof(pids);
+                pid_i = (pid_i + 1) % NQ;
                 unanswered++;
                 n_sent++;
             } else {
@@ -927,21 +965,24 @@ static void hs_task(void *arg)
             frames++;
             if (f.id == 0x7E8 && !f.ext && !f.rtr && f.dlc >= 4 && f.data[1] == 0x41) {
                 const int a = f.data[3];
-                switch (f.data[2]) {
-                case 0x0F: obd.iat = a - 40; break;
-                case 0x0E: obd.timing2 = a - 128; break;                 /* half degrees: a/2 - 64 */
-                case 0x06: obd.stft10 = (a - 128) * 1000 / 128; break;   /* 0.1 % */
-                case 0x07: obd.ltft10 = (a - 128) * 1000 / 128; break;
-                case 0x14: obd.o2_mv = a * 5; break;                     /* 5 mV per step */
-                case 0x04: obd.load = a * 100 / 255; break;
-                case 0x05: obd.ect = a - 40; break;
-                case 0x11: obd.thr = a * 100 / 255; break;
-                case 0x15: obd.o2b_mv = a * 5; break;
-                case 0x03: obd.fsys = a; break;                          /* 01 OL, 02 CL, 04 OL drive, 08 OL fault, 10 CL fault */
-                case 0x01: obd.mil = a & 0x80; obd.dtc = a & 0x7F; break;
-                default: continue;
+                int q = 0;
+                while (q < NQ && obd_pids[q] != f.data[2]) q++;
+                if (q < NQ) {
+                    switch (q) {
+                    case Q_TIMING: obd.val[q] = a - 128; break;                   /* half degrees: a/2 - 64 */
+                    case Q_STFT:
+                    case Q_LTFT:   obd.val[q] = (a - 128) * 1000 / 128; break;    /* 0.1 % */
+                    case Q_O2A:
+                    case Q_O2B:    obd.val[q] = a * 5; break;                     /* mV, 5 per step */
+                    case Q_LOAD:
+                    case Q_THR:    obd.val[q] = a * 100 / 255; break;
+                    case Q_IAT:
+                    case Q_ECT:    obd.val[q] = a - 40; break;
+                    case Q_DTC:    obd.val[q] = (a & 0x7F) | ((a & 0x80) ? 0x100 : 0); break;   /* count + MIL bit */
+                    default:       obd.val[q] = a; break;                         /* fuel system status */
+                    }
+                    obd.ts[q] = tn;
                 }
-                obd.t = tn;
                 unanswered = 0;
                 n_ans++;
             }
