@@ -12,6 +12,8 @@
  *    warn/alarm limits as dashed lines, the line coloured by level. Two or three: each line is scaled to its
  *    own min..max (units differ) and has its own colour (white, green, pink), no scale numbers. It records while the board is powered; OBD parameters too,
  *    since they are polled non-stop.
+ *  - A SK_ECO screen is the eco-driving assistant (fixed layout, see eco.h): estimated gear, shift up/down advice,
+ *    coasting hint and the instant consumption. It takes no cols/rows/items.
  *  - PARAMS[]   per parameter: the label printed above the value (incl. unit) and warning thresholds.
  *    Thresholds are in the parameter's own raw unit (see the comment on each enum value); the value turns
  *    AMBER outside warn_lo..warn_hi and RED outside alarm_lo..alarm_hi. NO_LO / NO_HI switch a limit off.
@@ -80,7 +82,7 @@ static const param_cfg_t PARAMS[NPARAM] = {
     [P_L100]      = { "L/100",     NO_LO, NO_HI, NO_LO, NO_HI },
     [P_LEFT_L]    = { "LEFT L",    80,    NO_HI, 50,    NO_HI },   /* amber under 8 L, red under 5 L */
     [P_LPH]       = { "L/H",       NO_LO, NO_HI, NO_LO, NO_HI },
-    [P_L100I]     = { "L/100 NOW", NO_LO, NO_HI, NO_LO, NO_HI },
+    [P_L100I]     = { "L/100 NOW", NO_LO, 90,    NO_LO, 130   },   /* amber over 9, red over 13 L/100 */
     [P_MAP]       = { "MAP KPA",   NO_LO, NO_HI, NO_LO, NO_HI },
     [P_IAT]       = { "IAT C",     NO_LO, 60,    NO_LO, 80    },
     [P_TIMING]    = { "TIMING",    NO_LO, NO_HI, NO_LO, NO_HI },
@@ -96,7 +98,7 @@ static const param_cfg_t PARAMS[NPARAM] = {
     [P_DTC]       = { "DTC",       NO_LO, NO_HI, NO_LO, 0     },   /* red as soon as one code is stored */
 };
 
-enum { SK_DRIVE, SK_GRID, SK_GRAPH };
+enum { SK_DRIVE, SK_GRID, SK_GRAPH, SK_ECO };
 
 typedef struct {
     const char *name;           /* for the log only */
@@ -111,6 +113,7 @@ static const screen_cfg_t SCREENS[] = {
     { "DRIVE", SK_DRIVE, 0, 0, 0, { 0 }, 0 },
     { "TRIP",  SK_GRID, 3, 2, 3, { P_TRIP_KM, P_TRIP_TIME, P_AVG, P_MAX_SPEED, P_MAX_RPM, P_CLOCK }, 0 },
     { "FUEL",  SK_GRID, 3, 1, 4, { P_FUEL_L, P_L100, P_LEFT_L }, 0 },
+    { "ECO",   SK_ECO, 0, 0, 0, { 0 }, 0 },
     { "ENG",   SK_GRID, 3, 2, 3, { P_MAP, P_IAT, P_TIMING, P_STFT, P_LTFT, P_O2A }, 0 },
     { "G SPEED", SK_GRAPH, 0, 0, 0, { P_SPEED }, 120 },
     { "G STFT",  SK_GRAPH, 0, 0, 0, { P_STFT }, 60 },

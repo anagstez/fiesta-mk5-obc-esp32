@@ -30,6 +30,7 @@
 #include "car_icons.h"
 #include "screens.h"
 #include "dtc_desc.h"
+#include "eco.h"
 
 #define ICON_W 76
 #define ICON_H 52
@@ -638,7 +639,7 @@ static int gspan(int scr)
 static uint16_t screen_pid_mask(int scr)
 {
     uint16_t m = 0;
-    if (scr < 0 || scr >= SCREEN_COUNT || SCREENS[scr].kind == SK_DRIVE) return 0;
+    if (scr < 0 || scr >= SCREEN_COUNT || SCREENS[scr].kind == SK_DRIVE || SCREENS[scr].kind == SK_ECO) return 0;
     const int n = SCREENS[scr].kind == SK_GRAPH ? GSER : 6;
     for (int k = 0; k < n; k++) {
         switch (SCREENS[scr].kind == SK_GRAPH ? gitem(scr, k) : SCREENS[scr].item[k]) {
@@ -846,6 +847,107 @@ static void draw_graph(int idx)
     else if (n > 1) draw_graph_multi(idx, n);
 }
 
+/* ---- eco-driving assistant (SK_ECO, constants in eco.h) ---- */
+static int eco_gear;                                 /* 0 = unknown (clutch in / shifting / too slow), 1..ECO_GEARS */
+static uint32_t eco_idle_ms;
+
+static int eco_gear_raw(void)
+{
+    if (!car_live || car.speed < ECO_MIN_KMH || car.rpm < 700) return 0;
+    const float r = (float)car.rpm / car.speed;
+    int best = 0;
+    float err = 1e9f;
+    for (int g = 0; g < ECO_GEARS; g++) {
+        const float e = fabsf(r / ECO_RATIO[g] - 1.0f);
+        if (e < err) { err = e; best = g + 1; }
+    }
+    return err <= ECO_TOL ? best : 0;
+}
+
+static void eco_step(uint32_t dt_ms)                 /* per frame: debounce the gear (a wrong flash while shifting is ignored) */
+{
+    static int cand;
+    static uint32_t cand_ms;
+    const int g = eco_gear_raw();
+    if (g != cand) { cand = g; cand_ms = 0; }
+    else if ((cand_ms += dt_ms) >= (g ? 300u : 700u)) eco_gear = g;
+    eco_idle_ms = (car_live && car.speed < 2 && car.rpm > 500) ? eco_idle_ms + dt_ms : 0;
+}
+
+static void draw_arrow(int x, int y, int w, int h, bool up, uint16_t c)
+{
+    const int head = h * 55 / 100, sw = w / 3;
+    for (int i = 0; i < h; i++) {
+        const int row = up ? i : h - 1 - i;              /* distance from the tip */
+        const int rw = row < head ? (row + 1) * w / head : sw;
+        fill_rect(x + (w - rw) / 2, y + i, rw, 1, c);
+    }
+}
+
+static void draw_eco(void)
+{
+    enum { A_NONE, A_OK, A_UP, A_DOWN, A_COAST, A_EASY, A_SLOW, A_IDLE, A_OFF, A_CLUTCH } adv = A_NONE;
+    char reason[24] = "";
+    const int g = eco_gear, spd = car.speed, rpm = car.rpm, gas = car.gas;
+    if (!car_live) { snprintf(reason, sizeof(reason), "NO CAN"); }
+    else if (spd < 3) {
+        adv = eco_idle_ms >= ECO_IDLE_STOP_MS ? A_OFF : A_IDLE;
+        snprintf(reason, sizeof(reason), "%s", adv == A_OFF ? "IDLING BURNS FUEL" : "START IN 1ST");
+    } else if (gas >= ECO_GAS_HEAVY) {
+        adv = A_EASY;
+        snprintf(reason, sizeof(reason), "GAS %d%%", gas);
+    } else if (spd >= ECO_SLOW_KMH) {
+        adv = A_SLOW;
+        snprintf(reason, sizeof(reason), "SPEED COSTS FUEL");
+    } else if (!g) {
+        adv = A_CLUTCH;
+    } else if (gas <= 1 && rpm >= 1200) {
+        adv = A_COAST;
+        snprintf(reason, sizeof(reason), "FUEL CUT 0 L/H");
+    } else if (g < ECO_GEARS && (rpm >= ECO_RPM_UP || (rpm >= ECO_RPM_UP_LIGHT && gas < ECO_GAS_LIGHT)) &&
+               spd * ECO_RATIO[g] >= ECO_RPM_NEXT_MIN) {
+        adv = A_UP;
+        snprintf(reason, sizeof(reason), "RPM %d TOO HIGH", rpm);
+    } else if (g > 1 && (rpm < ECO_RPM_LOW && gas >= ECO_GAS_LOAD)) {
+        adv = A_DOWN;
+        snprintf(reason, sizeof(reason), "RPM %d TOO LOW", rpm);
+    } else {
+        adv = A_OK;
+        snprintf(reason, sizeof(reason), "RPM %d OK", rpm);
+    }
+    static const char *const word[] = { "", "OK", "UP", "DOWN", "COAST", "EASY", "SLOW", "IDLE", "OFF", "CLUTCH" };
+    const uint16_t col = adv == A_COAST ? GREEN_ON : (adv == A_UP || adv == A_DOWN || adv == A_EASY || adv == A_SLOW || adv == A_OFF) ? AMBER : WHITE;
+
+    draw_text(4, 6, 1, GRAY, "GEAR");
+    char gb[4] = "-";
+    if (g) snprintf(gb, sizeof(gb), "%d", g);
+    draw_text(8, 20, 5, adv == A_UP || adv == A_DOWN ? AMBER : WHITE, gb);
+    if (adv == A_UP || adv == A_DOWN) {
+        char tb[8];
+        snprintf(tb, sizeof(tb), "TO %d", g + (adv == A_UP ? 1 : -1));
+        draw_text(4, 62, 1, AMBER, tb);
+    }
+    if (adv == A_UP || adv == A_DOWN) draw_arrow(46, 14, 26, 44, adv == A_UP, AMBER);
+    const int tx = (adv == A_UP || adv == A_DOWN) ? 82 : 46;
+    if (adv != A_NONE) draw_text(tx, 18, 3, col, word[adv]);
+    draw_text(tx, 46, 1, GRAY, reason);
+
+    fill_rect(190, 6, 1, LCD_H - 12, DIM);
+    char b[16] = "--";
+    int v = 0, lvl = 0;
+    const int id = spd >= 10 ? P_L100I : P_LPH;
+    if (param_get(id, &v)) { param_text(id, v, b, sizeof(b)); lvl = param_level(id, v); }
+    draw_text(198, 6, 1, GRAY, PARAMS[id].label);
+    int sc = 3;
+    while (sc > 1 && text_w(b, sc) > LCD_W - 198 - 4) sc--;
+    draw_text(198, 20, sc, lvl == 2 ? RED : lvl == 1 ? AMBER : WHITE, b);
+    char rb[16];
+    snprintf(rb, sizeof(rb), "RPM %d", rpm);
+    draw_text(198, 52, 1, GRAY, rb);
+    snprintf(rb, sizeof(rb), "KM/H %d", spd);
+    draw_text(198, 62, 1, GRAY, rb);
+}
+
 /* ---- fault codes (OBD-II Mode 03, read only; nothing is ever cleared) ---- */
 enum { DTC_IDLE, DTC_REQ, DTC_WAIT, DTC_DONE, DTC_FAIL, DTC_NOCAN };
 static volatile int dtc_state = DTC_IDLE;
@@ -931,6 +1033,7 @@ static void render(void)
     else if (screen >= SCREEN_COUNT)              draw_menu();
     else if (SCREENS[screen].kind == SK_GRID)     draw_grid(&SCREENS[screen]);
     else if (SCREENS[screen].kind == SK_GRAPH)    draw_graph(screen);
+    else if (SCREENS[screen].kind == SK_ECO)      draw_eco();
     else                                          draw_drive();
 
     if (screen != SCR_MENU && screen != SCR_DTC && btn_held_ms >= DTC_MS) {   /* what releasing now does */
@@ -1679,6 +1782,7 @@ void app_main(void)
             last_frame = now;
             car_step(dt);
             graph_step(dt);
+            eco_step(dt);
             cruise_step(dt / 1000.0f);
             render();
         }

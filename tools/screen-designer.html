@@ -203,6 +203,7 @@ const DEFAULTS = {
     { name: 'DRIVE', kind: 'DRIVE', cols: 0, rows: 0, scale: 0, items: [] },
     { name: 'TRIP', kind: 'GRID', cols: 3, rows: 2, scale: 3, items: ['TRIP_KM', 'TRIP_TIME', 'AVG', 'MAX_SPEED', 'MAX_RPM', 'CLOCK'] },
     { name: 'FUEL', kind: 'GRID', cols: 3, rows: 1, scale: 4, items: ['FUEL_L', 'L100', 'LEFT_L'] },
+    { name: 'ECO', kind: 'ECO', cols: 0, rows: 0, scale: 0, items: [] },
     { name: 'ENG', kind: 'GRID', cols: 3, rows: 2, scale: 3, items: ['MAP', 'IAT', 'TIMING', 'STFT', 'LTFT', 'O2A'] },
     { name: 'G SPEED', kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: 120, items: ['SPEED'] },
     { name: 'G STFT', kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: 60, items: ['STFT'] },
@@ -266,6 +267,15 @@ function drawScreen(canvas, s) {
     drawText(ctx, 8, 8, 2, COLORS.WHITE, 'DRIVE');
     drawText(ctx, 8, 30, 1, COLORS.GRAY, 'FIXED GAUGE LAYOUT');
     drawText(ctx, 8, 42, 1, COLORS.GRAY, 'RPM BAR  SPEED  CHIPS');
+    return;
+  }
+  if (s.kind === 'ECO') {
+    drawText(ctx, 4, 6, 1, COLORS.GRAY, 'GEAR');
+    drawText(ctx, 8, 20, 5, COLORS.WHITE, '3');
+    drawText(ctx, 46, 18, 3, COLORS.WHITE, 'OK');
+    drawText(ctx, 46, 46, 1, COLORS.GRAY, 'RPM 2100 OK');
+    drawText(ctx, 198, 6, 1, COLORS.GRAY, 'L/100 NOW');
+    drawText(ctx, 198, 20, 3, COLORS.WHITE, '6.4');
     return;
   }
   if (s.kind === 'GRAPH') { drawGraph(ctx, s); return; }
@@ -453,7 +463,7 @@ static const param_cfg_t PARAMS[NPARAM] = {`);
   });
   out.push(`};
 
-enum { SK_DRIVE, SK_GRID, SK_GRAPH };
+enum { SK_DRIVE, SK_GRID, SK_GRAPH, SK_ECO };
 
 typedef struct {
     const char *name;           /* for the log only */
@@ -467,6 +477,7 @@ typedef struct {
 static const screen_cfg_t SCREENS[] = {`);
   state.screens.forEach(s => {
     if (s.kind === 'DRIVE') { out.push(`    { "${s.name}", SK_DRIVE, 0, 0, 0, { 0 }, 0 },`); return; }
+    if (s.kind === 'ECO') { out.push(`    { "${s.name}", SK_ECO, 0, 0, 0, { 0 }, 0 },`); return; }
     if (s.kind === 'GRAPH') { out.push(`    { ${pad('"' + s.name + '",', 10)} SK_GRAPH, 0, 0, 0, { ${graphIds(s).map(i => 'P_' + i).join(', ') || 0} }, ${s.span || 0} },`); return; }
     let n = s.items.length;
     while (n && !s.items[n - 1]) n--;
@@ -484,12 +495,13 @@ function importH(text) {
     params[m[1]] = [m[2], lim2(m[3]), lim2(m[4]), lim2(m[5]), lim2(m[6])];
   }
   const tail = text.slice(Math.max(0, text.indexOf('SCREENS[]')));
-  for (const m of tail.matchAll(/\{\s*"([^"]*)"\s*,\s*SK_(DRIVE|GRID|GRAPH)(?:\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*\{([^}]*)\}(?:\s*,\s*(\d+))?)?/g)) {
+  for (const m of tail.matchAll(/\{\s*"([^"]*)"\s*,\s*SK_(DRIVE|GRID|GRAPH|ECO)(?:\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*\{([^}]*)\}(?:\s*,\s*(\d+))?)?/g)) {
     if (m[2] === 'GRAPH') {
       const its = (m[6] || '').split(',').map(t => t.trim().replace(/^P_/, '')).map(t => PID[t] ? t : null).slice(0, 3);
       screens.push({ name: m[1], kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: +(m[7] || 0), items: its });
       continue;
     }
+    if (m[2] === 'ECO') { screens.push({ name: m[1], kind: 'ECO', cols: 0, rows: 0, scale: 0, items: [] }); continue; }
     if (m[2] === 'DRIVE') { screens.push({ name: m[1], kind: 'DRIVE', cols: 0, rows: 0, scale: 0, items: [] }); continue; }
     const items = (m[6] || '').split(',').map(t => t.trim().replace(/^P_/, '')).map(t => PID[t] ? t : null);
     while (items.length < 6) items.push(null);
@@ -531,6 +543,10 @@ function renderEditor() {
   props.append(el('label', {}, 'назва ', name));
   const cells = $('cells'); cells.replaceChildren();
   const cp = $('cellProps'); cp.replaceChildren();
+  if (s.kind === 'ECO') {
+    props.append(el('span', { className: 'hint', textContent: 'ECO — помічник водія з фіксованим макетом (передача, підказка перемикання, миттєва витрата); пороги в eco.h.' }));
+    return;
+  }
   if (s.kind === 'DRIVE') {
     props.append(el('span', { className: 'hint', textContent: 'DRIVE має фіксований макет, його вміст тут не налаштовується.' }));
     return;
