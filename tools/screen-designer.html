@@ -201,14 +201,17 @@ const DEFAULTS = {
   },
   screens: [
     { name: 'DRIVE', kind: 'DRIVE', cols: 0, rows: 0, scale: 0, items: [] },
+    { name: 'ECO', kind: 'ECO', cols: 0, rows: 0, scale: 0, items: [] },
+    { name: 'ECON', kind: 'GRID', cols: 2, rows: 2, scale: 3, items: ['L100I', 'L100', 'LPH', 'AVG'] },
     { name: 'TRIP', kind: 'GRID', cols: 3, rows: 2, scale: 3, items: ['TRIP_KM', 'TRIP_TIME', 'AVG', 'MAX_SPEED', 'MAX_RPM', 'CLOCK'] },
     { name: 'FUEL', kind: 'GRID', cols: 3, rows: 1, scale: 4, items: ['FUEL_L', 'L100', 'LEFT_L'] },
-    { name: 'ECO', kind: 'ECO', cols: 0, rows: 0, scale: 0, items: [] },
+    { name: 'G L100', kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: 60, items: ['L100I', 'SPEED', 'GAS'] },
+    { name: 'G TEMP', kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: 600, items: ['COOL', 'IAT'] },
+    { name: 'HEALTH', kind: 'GRID', cols: 3, rows: 2, scale: 3, items: ['COOL', 'VOLT', 'IAT', 'LOAD', 'TRIM', 'DTC'] },
     { name: 'ENG', kind: 'GRID', cols: 3, rows: 2, scale: 3, items: ['MAP', 'IAT', 'TIMING', 'STFT', 'LTFT', 'O2A'] },
+    { name: 'ENG 2', kind: 'GRID', cols: 3, rows: 2, scale: 3, items: ['LOAD', 'ECT', 'THR', 'O2B', 'FSYS', 'DTC'] },
     { name: 'G SPEED', kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: 120, items: ['SPEED'] },
-    { name: 'G STFT', kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: 60, items: ['STFT'] },
-    { name: 'G DRIVE', kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: 60, items: ['RPM', 'SPEED', 'GAS'] },
-    { name: 'ENG 2', kind: 'GRID', cols: 3, rows: 2, scale: 3, items: ['LOAD', 'ECT', 'THR', 'O2B', 'FSYS', 'DTC'] }
+    { name: 'G STFT', kind: 'GRAPH', cols: 0, rows: 0, scale: 0, span: 60, items: ['STFT'] }
   ]
 };
 

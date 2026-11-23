@@ -111,12 +111,15 @@ typedef struct {
 
 static const screen_cfg_t SCREENS[] = {
     { "DRIVE", SK_DRIVE, 0, 0, 0, { 0 }, 0 },
+    { "ECO",   SK_ECO, 0, 0, 0, { 0 }, 0 },
+    { "ECON",  SK_GRID, 2, 2, 3, { P_L100I, P_L100, P_LPH, P_AVG }, 0 },              /* everyday economy: now, trip, per hour, average speed */
     { "TRIP",  SK_GRID, 3, 2, 3, { P_TRIP_KM, P_TRIP_TIME, P_AVG, P_MAX_SPEED, P_MAX_RPM, P_CLOCK }, 0 },
     { "FUEL",  SK_GRID, 3, 1, 4, { P_FUEL_L, P_L100, P_LEFT_L }, 0 },
-    { "ECO",   SK_ECO, 0, 0, 0, { 0 }, 0 },
+    { "G L100", SK_GRAPH, 0, 0, 0, { P_L100I, P_SPEED, P_GAS }, 60 },                 /* what the pedal does to the consumption */
+    { "G TEMP", SK_GRAPH, 0, 0, 0, { P_COOL, P_IAT }, 600 },                          /* warm-up curve */
+    { "HEALTH", SK_GRID, 3, 2, 3, { P_COOL, P_VOLT, P_IAT, P_LOAD, P_TRIM, P_DTC }, 0 },   /* quick check: temps, battery, load, fuel trim, fault codes */
     { "ENG",   SK_GRID, 3, 2, 3, { P_MAP, P_IAT, P_TIMING, P_STFT, P_LTFT, P_O2A }, 0 },
+    { "ENG 2", SK_GRID, 3, 2, 3, { P_LOAD, P_ECT, P_THR, P_O2B, P_FSYS, P_DTC }, 0 },
     { "G SPEED", SK_GRAPH, 0, 0, 0, { P_SPEED }, 120 },
     { "G STFT",  SK_GRAPH, 0, 0, 0, { P_STFT }, 60 },
-    { "G DRIVE", SK_GRAPH, 0, 0, 0, { P_RPM, P_SPEED, P_GAS }, 60 },
-    { "ENG 2", SK_GRID, 3, 2, 3, { P_LOAD, P_ECT, P_THR, P_O2B, P_FSYS, P_DTC }, 0 },
 };
