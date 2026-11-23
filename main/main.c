@@ -141,6 +141,21 @@ static int fuel_ul = 100;
 static uint32_t fuel_last, trip_fuel, tank_cnt, tank_saved;
 static struct { uint32_t steps, m; } eco_map[ECO_GEARS][ECO_L_SPEEDS];   /* learned consumption, see eco.h */
 static bool eco_map_dirty;
+
+/* ECO thresholds that the menu "ECO SET" edits; defaults are the #defines in eco.h, saved in NVS under `key` */
+static int eco_up = ECO_RPM_UP, eco_up_lt = ECO_RPM_UP_LIGHT, eco_low = ECO_RPM_LOW, eco_heavy = ECO_GAS_HEAVY;
+static int eco_slow = ECO_SLOW_KMH, eco_idle_s = ECO_IDLE_STOP_MS / 1000, eco_save = ECO_L_SAVE;
+typedef struct { const char *label, *key; int *v; int lo, hi, step; } eco_set_t;
+static const eco_set_t ECO_SET[] = {
+    { "UP RPM",   "e_up",    &eco_up,    1500, 4500, 100 },     /* shift up at or above this */
+    { "UP LIGHT", "e_uplt",  &eco_up_lt, 1200, 4000, 100 },     /* ... or above this with a light pedal */
+    { "LUG RPM",  "e_low",   &eco_low,   800,  2500, 100 },     /* shift down below this under load */
+    { "EASY GAS", "e_heavy", &eco_heavy, 40,   100,  5   },     /* pedal % that triggers EASY */
+    { "SLOW KMH", "e_slow",  &eco_slow,  80,   200,  5   },
+    { "IDLE OFF", "e_idle",  &eco_idle_s, 5,   120,  5   },     /* seconds of idling before OFF */
+    { "SAVE %",   "e_save",  &eco_save,  2,    30,   1   },     /* learned advice needs at least this saving */
+};
+#define ECO_NSET ((int)(sizeof(ECO_SET) / sizeof(ECO_SET[0])))
 static float flow_ml_s;
 static int max_speed, max_rpm;
 static volatile TickType_t last_speed;   /* tick of the last 0x201 frame (speed source) */
@@ -261,6 +276,10 @@ static void settings_load(void)
         int16_t u;
         if (nvs_get_i16(h, "fuel_ul", &u) == ESP_OK) fuel_ul = clampi(u, 20, 400);
         if (nvs_get_u32(h, "fuel_cnt", &tank_cnt) == ESP_OK) tank_saved = tank_cnt;
+        for (int i = 0; i < ECO_NSET; i++) {
+            int16_t ev;
+            if (nvs_get_i16(h, ECO_SET[i].key, &ev) == ESP_OK) *ECO_SET[i].v = clampi(ev, ECO_SET[i].lo, ECO_SET[i].hi);
+        }
         size_t ml = sizeof(eco_map);
         if (nvs_get_blob(h, "eco_map", eco_map, &ml) != ESP_OK || ml != sizeof(eco_map)) memset(eco_map, 0, sizeof(eco_map));
         nvs_close(h);
@@ -277,6 +296,7 @@ static void settings_save(void)
     nvs_set_i8(h, "g_param", (int8_t)g_param);
     nvs_set_i16(h, "g_span", (int16_t)g_span);
     nvs_set_i16(h, "fuel_ul", (int16_t)fuel_ul);
+    for (int i = 0; i < ECO_NSET; i++) nvs_set_i16(h, ECO_SET[i].key, (int16_t)*ECO_SET[i].v);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -932,11 +952,11 @@ static int eco_learned_advice(int gear, int spd, int *pct)
         const int g = gear + d;
         if (g < 1 || g > ECO_GEARS) continue;
         const float rpm = spd * ECO_RATIO[g - 1];
-        if (rpm < ECO_RPM_NEXT_MIN || rpm > ECO_RPM_UP) continue;       /* the target gear must itself be sensible */
+        if (rpm < ECO_RPM_NEXT_MIN || rpm > eco_up) continue;       /* the target gear must itself be sensible */
         const int c = eco_cost(g, spd);
         if (!c) continue;
         const int p = (cur - c) * 100 / cur;
-        if (p >= ECO_L_SAVE && p > bp) { bp = p; best = d; }
+        if (p >= eco_save && p > bp) { bp = p; best = d; }
     }
     *pct = bp;
     return best;
@@ -959,12 +979,12 @@ static void draw_eco(void)
     const int g = eco_gear, spd = car.speed, rpm = car.rpm, gas = car.gas;
     if (!car_live) { snprintf(reason, sizeof(reason), "NO CAN"); }
     else if (spd < 3) {
-        adv = eco_idle_ms >= ECO_IDLE_STOP_MS ? A_OFF : A_IDLE;
+        adv = eco_idle_ms >= (uint32_t)eco_idle_s * 1000 ? A_OFF : A_IDLE;
         snprintf(reason, sizeof(reason), "%s", adv == A_OFF ? "IDLING BURNS FUEL" : "START IN 1ST");
-    } else if (gas >= ECO_GAS_HEAVY) {
+    } else if (gas >= eco_heavy) {
         adv = A_EASY;
         snprintf(reason, sizeof(reason), "GAS %d%%", gas);
-    } else if (spd >= ECO_SLOW_KMH) {
+    } else if (spd >= eco_slow) {
         adv = A_SLOW;
         snprintf(reason, sizeof(reason), "SPEED COSTS FUEL");
     } else if (!g) {
@@ -972,11 +992,11 @@ static void draw_eco(void)
     } else if (gas <= 1 && rpm >= 1200) {
         adv = A_COAST;
         snprintf(reason, sizeof(reason), "FUEL CUT 0 L/H");
-    } else if (g < ECO_GEARS && (rpm >= ECO_RPM_UP || (rpm >= ECO_RPM_UP_LIGHT && gas < ECO_GAS_LIGHT)) &&
+    } else if (g < ECO_GEARS && (rpm >= eco_up || (rpm >= eco_up_lt && gas < ECO_GAS_LIGHT)) &&
                spd * ECO_RATIO[g] >= ECO_RPM_NEXT_MIN) {
         adv = A_UP;
         snprintf(reason, sizeof(reason), "RPM %d TOO HIGH", rpm);
-    } else if (g > 1 && (rpm < ECO_RPM_LOW && gas >= ECO_GAS_LOAD)) {
+    } else if (g > 1 && (rpm < eco_low && gas >= ECO_GAS_LOAD)) {
         adv = A_DOWN;
         snprintf(reason, sizeof(reason), "RPM %d TOO LOW", rpm);
     } else {
@@ -1218,10 +1238,13 @@ static void IRAM_ATTR dump_push_isr(char bus, uint32_t id, const uint8_t *d, int
 }
 
 /* settings menu: turn = move (or change the value in edit mode), press = select/confirm, hold = back to DRIVE */
-enum { MI_BRIGHT, MI_AUTOLOCK, MI_GRAPH_PARAM, MI_GRAPH_SPAN, MI_FUEL_CAL, MI_TANK, MI_TRIP_RESET, MI_ECO_RESET, MI_DUMP, MI_EXIT, NMENU };
+enum { MI_BRIGHT, MI_AUTOLOCK, MI_GRAPH_PARAM, MI_GRAPH_SPAN, MI_FUEL_CAL, MI_TANK, MI_TRIP_RESET, MI_ECO_SET, MI_ECO_RESET, MI_DUMP, MI_EXIT, NMENU };
 #define MENU_ROWS 4
 static int menu_sel, menu_top;
 static bool menu_edit;
+static bool menu_eco;                                  /* in the ECO SET sub-list: rows = ECO_SET[] + BACK */
+static int menu_main_sel;
+#define menu_n() (menu_eco ? ECO_NSET + 1 : NMENU)
 
 static const int SPANS[] = { 0, 30, 60, 120, 300, 600 };   /* GR SPAN choices, s (0 = as in screens.h) */
 #define NSPAN ((int)(sizeof(SPANS) / sizeof(SPANS[0])))
@@ -1230,13 +1253,17 @@ static void menu_leave(void)
 {
     if (menu_edit) settings_save();
     menu_edit = false;
+    menu_eco = false;
     screen = SCR_DRIVE;
     if (SCREENS[0].kind != SK_DRIVE) ESP_LOGE(TAG, "screens.h: SCREENS[0] must be the DRIVE screen");
 }
 
 static void menu_rotate(int steps)
 {
-    if (menu_edit) {                                     /* BRIGHT, GR PARAM, GR SPAN, FUEL CAL are editable */
+    if (menu_edit && menu_eco) {
+        const eco_set_t *e = &ECO_SET[menu_sel];
+        *e->v = clampi(*e->v + e->step * steps, e->lo, e->hi);
+    } else if (menu_edit) {                              /* BRIGHT, GR PARAM, GR SPAN, FUEL CAL are editable */
         if (menu_sel == MI_BRIGHT) { bright = clampi(bright + 10 * steps, 10, 100); backlight_set(bright); }
         else if (menu_sel == MI_FUEL_CAL) fuel_ul = clampi(fuel_ul + 5 * steps, 20, 400);
         else if (menu_sel == MI_GRAPH_PARAM) { g_param = ((g_param + steps) % NPARAM + NPARAM) % NPARAM; graph_clear(graph_first()); }
@@ -1248,7 +1275,7 @@ static void menu_rotate(int steps)
             graph_clear(graph_first());
         }
     } else {
-        menu_sel = ((menu_sel + steps) % NMENU + NMENU) % NMENU;
+        menu_sel = ((menu_sel + steps) % menu_n() + menu_n()) % menu_n();
         if (menu_sel < menu_top) menu_top = menu_sel;
         if (menu_sel >= menu_top + MENU_ROWS) menu_top = menu_sel - MENU_ROWS + 1;
     }
@@ -1256,6 +1283,15 @@ static void menu_rotate(int steps)
 
 static void menu_press(void)
 {
+    if (menu_eco) {
+        if (menu_sel == ECO_NSET) {                      /* BACK */
+            menu_eco = false; menu_sel = menu_main_sel; menu_top = clampi(menu_sel - MENU_ROWS + 1, 0, NMENU - MENU_ROWS);
+        } else {
+            if (menu_edit) settings_save();
+            menu_edit = !menu_edit;
+        }
+        return;
+    }
     switch (menu_sel) {
     case MI_BRIGHT:
     case MI_FUEL_CAL:
@@ -1278,6 +1314,9 @@ static void menu_press(void)
         trip_m = 0; trip_ms = 0; max_speed = 0; max_rpm = 0;
         ESP_LOGI(TAG, "trip reset");
         break;
+    case MI_ECO_SET:
+        menu_main_sel = menu_sel; menu_eco = true; menu_sel = 0; menu_top = 0;
+        break;
     case MI_ECO_RESET:
         memset(eco_map, 0, sizeof(eco_map));
         eco_map_save();
@@ -1294,16 +1333,19 @@ static void menu_press(void)
 
 static void draw_menu(void)
 {
-    static const char *const label[NMENU] = { "BRIGHT", "AUTO LOCK", "GR PARAM", "GR SPAN", "FUEL CAL", "TANK L", "TRIP RESET", "ECO RESET", "CAN DUMP", "EXIT" };
+    static const char *const label[NMENU] = { "BRIGHT", "AUTO LOCK", "GR PARAM", "GR SPAN", "FUEL CAL", "TANK L", "TRIP RESET", "ECO SET", "ECO RESET", "CAN DUMP", "EXIT" };
     char v[24];
+    const int nrows = menu_n();
     for (int r = 0; r < MENU_ROWS; r++) {
         const int i = menu_top + r;
+        if (i >= nrows) break;
         const int y = 2 + r * 18;
         const bool sel = i == menu_sel;
         if (sel) fill_rect(2, y, LCD_W - 14, 17, FORD_BLUE);
-        draw_text(10, y + 2, 2, sel ? WHITE : GRAY, label[i]);
+        draw_text(10, y + 2, 2, sel ? WHITE : GRAY, menu_eco ? (i < ECO_NSET ? ECO_SET[i].label : "BACK") : label[i]);
         v[0] = 0;
-        if (i == MI_BRIGHT) snprintf(v, sizeof(v), "%d%%", bright);
+        if (menu_eco) { if (i < ECO_NSET) snprintf(v, sizeof(v), "%d", *ECO_SET[i].v); }
+        else if (i == MI_BRIGHT) snprintf(v, sizeof(v), "%d%%", bright);
         else if (i == MI_AUTOLOCK) snprintf(v, sizeof(v), "%s", al_on ? "ON" : "OFF");
         else if (i == MI_GRAPH_PARAM) snprintf(v, sizeof(v), "%s", graph_first() < 0 ? "-" : g_param ? PARAMS[g_param].label : "CFG");
         else if (i == MI_GRAPH_SPAN) { if (graph_first() < 0) snprintf(v, sizeof(v), "-"); else if (g_span) snprintf(v, sizeof(v), "%ds", g_span); else snprintf(v, sizeof(v), "CFG"); }
@@ -1312,9 +1354,9 @@ static void draw_menu(void)
         else if (i == MI_DUMP) snprintf(v, sizeof(v), "%s", dump_on ? "ON" : "OFF");
         draw_text(LCD_W - 18 - text_w(v, 2), y + 2, 2, sel && menu_edit ? AMBER : sel ? WHITE : GRAY, v);
     }
-    const int th = 72 * MENU_ROWS / NMENU;               /* scroll thumb */
+    const int th = 72 * MENU_ROWS / nrows;               /* scroll thumb */
     fill_rect(LCD_W - 6, 2, 3, 72, DIM);
-    fill_rect(LCD_W - 6, 2 + (72 - th) * menu_top / (NMENU - MENU_ROWS), 3, th, GRAY);
+    fill_rect(LCD_W - 6, 2 + (72 - th) * menu_top / (nrows - MENU_ROWS), 3, th, GRAY);
 }
 
 /* MS-CAN frame -> car state; runs in the TWAI rx ISR, so integer maths only (no FPU in ISRs) */
