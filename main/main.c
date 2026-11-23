@@ -2,7 +2,7 @@
  * ST7789P3 2.25" 76x284 on ESP32-S3 — Ford Fiesta MK5 on-board computer, landscape 284x76
  *  data: MS-CAN (125 kbit/s) via the on-chip TWAI controller in listen-only mode (never transmits),
  *        IDs/bytes from github.com/roncapat/Ford-Fiesta-MK5-MS-CAN-bus; shows NO CAN without frames
- *  screens: DRIVE (rpm/speed/gauges/indicators), TRIP (trip stats); BOOT button (GPIO0), encoder (HW-040) or "N" over USB = next
+ *  screens: DRIVE (rpm/speed/gauges/indicators), TRIP (6 trip stats), FUEL (fuel + volt); BOOT button (GPIO0), encoder (HW-040) or "N" over USB = next
  */
 #include <math.h>
 #include <stdio.h>
@@ -74,7 +74,7 @@ static const char *TAG = "obc";
 #define RPM_SEGS  16
 #define RPM_MAX   7000
 
-enum { SCR_DRIVE, SCR_TRIP, SCR_MENU, NSCREEN };
+enum { SCR_DRIVE, SCR_TRIP, SCR_FUEL, SCR_MENU, NSCREEN };
 #define NCYCLE    SCR_MENU           /* screens in the turn cycle; the menu is entered by a 5 s hold */
 #define LONG_MS   700                /* hold in the menu: back to DRIVE */
 #define MENU_MS   5000               /* hold: open the settings menu */
@@ -511,7 +511,8 @@ static void draw_drive(void)
     }
 }
 
-static void draw_trip(void)
+/* page 0: trip stats (3 x 2), page 1: fuel + voltage (3 x 1, larger) */
+static void draw_trip(int page)
 {
     const float km = trip_m / 1000.0f;
     const float hours = trip_ms / 3.6e6f;
@@ -537,16 +538,21 @@ static void draw_trip(void)
     }
     snprintf(vals[8], sizeof(vals[8]), "%d.%d", car.volt10 / 10, car.volt10 % 10);
 
-    for (int i = 0; i < 9; i++) {
-        const int x = 4 + (i % 3) * 94;
-        const int y = 2 + (i / 3) * 25;
-        draw_text(x, y, 1, GRAY, label[i]);
-        draw_text(x, y + 9, 2, WHITE, vals[i]);
+    const int first = page ? 6 : 0, n = page ? 3 : 6, rows = page ? 1 : 2;
+    const int cell_h = LCD_H / rows;
+    for (int k = 0; k < n; k++) {
+        const int i = first + k;
+        const int x = 4 + (k % 3) * 94;
+        const int y = (k / 3) * cell_h;
+        int sc = page ? 4 : 3;
+        if (text_w(vals[i], sc) > 86) sc--;              /* long trip distance still has to fit its column */
+        const int lh = 7, vh = 7 * sc, top = y + (cell_h - (lh + 4 + vh)) / 2;
+        draw_text(x, top, 1, GRAY, label[i]);
+        draw_text(x, top + lh + 4, sc, WHITE, vals[i]);
     }
     fill_rect(93, 2, 1, 72, DIM);
     fill_rect(187, 2, 1, 72, DIM);
-    fill_rect(4, 25, 276, 1, DIM);
-    fill_rect(4, 50, 276, 1, DIM);
+    if (!page) fill_rect(4, 38, 276, 1, DIM);
     if (!car_live) draw_text(LCD_W - 4 - text_w("NO CAN", 1), 2, 1, RED, "NO CAN");
 }
 
@@ -577,7 +583,8 @@ static void render(void)
     }
 
     if (screen == SCR_DRIVE)     draw_drive();
-    else if (screen == SCR_TRIP) draw_trip();
+    else if (screen == SCR_TRIP) draw_trip(0);
+    else if (screen == SCR_FUEL) draw_trip(1);
     else                         draw_menu();
 
     if (fb_dump) { fb_dump = false; fb_print(); }
@@ -936,7 +943,7 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     backlight_set(bright);
-    ESP_LOGI(TAG, "ready; MS-CAN listen-only 125k on RX=%d, screens DRIVE/TRIP, BOOT or 'N' = next, 'D' = toggle raw CAN dump, hold BOOT or 'S' = cruise set/cancel, '+'/'-' = set speed, encoder: turn = screen, click = cruise set/cancel, held + turn = set speed, hold 5 s = menu", PIN_CAN_RX);
+    ESP_LOGI(TAG, "ready; MS-CAN listen-only 125k on RX=%d, screens DRIVE/TRIP/FUEL, BOOT or 'N' = next, 'D' = toggle raw CAN dump, hold BOOT or 'S' = cruise set/cancel, '+'/'-' = set speed, encoder: turn = screen, click = cruise set/cancel, held + turn = set speed, hold 5 s = menu", PIN_CAN_RX);
 
     char line[16];
     int n = 0;
