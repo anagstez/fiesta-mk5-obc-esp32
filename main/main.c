@@ -29,6 +29,7 @@
 #include "mcp2515.h"
 #include "car_icons.h"
 #include "screens.h"
+#include "dtc_desc.h"
 
 #define ICON_W 76
 #define ICON_H 52
@@ -79,6 +80,8 @@ static const char *TAG = "obc";
 #define SCR_DRIVE 0                  /* SCREENS[0] */
 #define GSER      3                  /* parameters per SK_GRAPH screen */
 #define SCR_MENU  SCREEN_COUNT       /* after the configured screens, entered by a 5 s hold */
+#define SCR_DTC   (SCREEN_COUNT + 1) /* fault code list, entered by releasing the button after 3..5 s */
+#define DTC_MS    3000               /* hold this long (and release before MENU_MS): read the fault codes */
 #define NCYCLE    SCREEN_COUNT       /* screens in the turn cycle */
 #define LONG_MS   700                /* hold in the menu: back to DRIVE */
 #define MENU_MS   5000               /* hold: open the settings menu */
@@ -139,6 +142,7 @@ static float flow_ml_s;
 static int max_speed, max_rpm;
 static volatile TickType_t last_speed;   /* tick of the last 0x201 frame (speed source) */
 
+#define ENABLE_CRUISE 0                  /* 2026-11-23: cruise switched off for now (no click action, no S/+/- over USB, no menu item) */
 /* advisory cruise: computes the throttle demand that would hold the set speed, drives nothing */
 #define CC_MIN_KMH   15
 #define CC_MAX_KMH   130
@@ -178,6 +182,8 @@ static const struct { char c; uint8_t col[5]; } font[] = {
     {'S', {0x46, 0x49, 0x49, 0x49, 0x31}}, {'V', {0x1F, 0x20, 0x40, 0x20, 0x1F}},
     {'W', {0x3F, 0x40, 0x38, 0x40, 0x3F}}, {'Y', {0x07, 0x08, 0x70, 0x08, 0x07}},
     {':', {0x00, 0x36, 0x36, 0x00, 0x00}}, {'/', {0x20, 0x10, 0x08, 0x04, 0x02}},
+    {'J', {0x20, 0x40, 0x41, 0x3F, 0x01}}, {'Q', {0x3E, 0x41, 0x51, 0x21, 0x5E}},
+    {'Z', {0x61, 0x51, 0x49, 0x45, 0x43}},
 };
 
 /* RGB888 -> RGB565, byte-swapped for SPI */
@@ -840,6 +846,61 @@ static void draw_graph(int idx)
     else if (n > 1) draw_graph_multi(idx, n);
 }
 
+/* ---- fault codes (OBD-II Mode 03, read only; nothing is ever cleared) ---- */
+enum { DTC_IDLE, DTC_REQ, DTC_WAIT, DTC_DONE, DTC_FAIL, DTC_NOCAN };
+static volatile int dtc_state = DTC_IDLE;
+static uint16_t dtc_raw[24];                         /* raw 2-byte codes as sent by the PCM */
+static volatile int dtc_n;
+static TickType_t dtc_t_start;                       /* when the read was started, for the give-up timeout */
+static int dtc_top;                                  /* first visible row */
+static volatile uint32_t btn_held_ms;                /* how long the button has been held now (0 = not pressed), for the on-screen hint */
+
+static void dtc_name(uint16_t raw, char *out)        /* 0x0171 -> "P0171" */
+{
+    snprintf(out, 6, "%c%d%03X", "PCBU"[raw >> 14], (raw >> 12) & 3, raw & 0xFFF);
+}
+
+static void dtc_start(void)
+{
+    dtc_n = 0;
+    dtc_top = 0;
+    dtc_t_start = xTaskGetTickCount();
+    dtc_state = car_live ? DTC_REQ : DTC_NOCAN;
+}
+
+static void draw_dtc(void)
+{
+    char t[64];
+    int mil = -1, v;
+    if (param_get(P_DTC, &v)) mil = (v & 0x100) != 0;
+    switch (dtc_state) {
+    case DTC_REQ:
+    case DTC_WAIT:   snprintf(t, sizeof(t), "DTC  READING..."); break;
+    case DTC_NOCAN:  snprintf(t, sizeof(t), "DTC  NO CAN"); break;
+    case DTC_FAIL:   snprintf(t, sizeof(t), "DTC  NO ANSWER FROM PCM"); break;
+    default:         snprintf(t, sizeof(t), "DTC  %d STORED  %s", (int)dtc_n, mil < 0 ? "" : mil ? "MIL ON" : "MIL OFF"); break;
+    }
+    draw_text(4, 3, 1, dtc_state == DTC_FAIL || dtc_state == DTC_NOCAN ? RED : WHITE, t);
+    fill_rect(4, 12, LCD_W - 8, 1, DIM);
+    if (dtc_state == DTC_DONE && dtc_n == 0) draw_text(4, 30, 2, WHITE, "NO FAULTS");
+    const int rows = 5;
+    for (int r = 0; r < rows && dtc_state == DTC_DONE; r++) {
+        const int i = dtc_top + r;
+        if (i >= dtc_n) break;
+        char code[6];
+        dtc_name(dtc_raw[i], code);
+        snprintf(t, sizeof(t), "%s %s", code, dtc_text(code));
+        t[46] = 0;                                   /* 46 characters fit the 284 px width */
+        draw_text(4, 16 + r * 12, 1, code[0] == 'P' ? WHITE : AMBER, t);
+    }
+    if (dtc_state == DTC_DONE && dtc_n > rows) {
+        const int th = 62 * rows / dtc_n;            /* scroll thumb */
+        fill_rect(LCD_W - 6, 14, 3, 62, DIM);
+        fill_rect(LCD_W - 6, 14 + (62 - th) * dtc_top / (dtc_n - rows), 3, th, GRAY);
+    }
+    draw_text(LCD_W - 4 - text_w("CLICK EXIT", 1), 3, 1, GRAY, "CLICK EXIT");
+}
+
 static void draw_menu(void);
 static volatile bool fb_dump;            /* 'F' over USB: print the next finished frame as hex (screenshot) */
 
@@ -866,11 +927,18 @@ static void render(void)
         for (int x = 0; x < LCD_W; x++) fb[y * LCD_W + x] = c;
     }
 
-    if (screen >= SCREEN_COUNT)                   draw_menu();
+    if (screen == SCR_DTC)                        draw_dtc();
+    else if (screen >= SCREEN_COUNT)              draw_menu();
     else if (SCREENS[screen].kind == SK_GRID)     draw_grid(&SCREENS[screen]);
     else if (SCREENS[screen].kind == SK_GRAPH)    draw_graph(screen);
     else                                          draw_drive();
 
+    if (screen != SCR_MENU && screen != SCR_DTC && btn_held_ms >= DTC_MS) {   /* what releasing now does */
+        const char *hint = btn_held_ms >= MENU_MS ? "MENU" : "RELEASE: FAULT CODES";
+        const int w = text_w(hint, 1) + 8, x = (LCD_W - w) / 2;
+        fill_rect(x, LCD_H / 2 - 8, w, 16, DIM);
+        draw_text(x + 4, LCD_H / 2 - 3, 1, WHITE, hint);
+    }
     if (fb_dump) { fb_dump = false; fb_print(); }
     ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_W, LCD_H, fb));
 }
@@ -915,6 +983,7 @@ static void cruise_cancel(const char *why)
 
 static void cruise_toggle(void)
 {
+    if (!ENABLE_CRUISE) return;
     if (cc_active) { cruise_cancel("driver"); return; }
     if (!car_live) { ESP_LOGW(TAG, "cruise refused: no live CAN data"); return; }
     if (car.speed < CC_MIN_KMH || car.speed > CC_MAX_KMH) {
@@ -932,6 +1001,7 @@ static void cruise_toggle(void)
 
 static void cruise_adjust(int d)
 {
+    if (!ENABLE_CRUISE) return;
     if (cc_active) cc_set = clampi(cc_set + d, CC_MIN_KMH, CC_MAX_KMH);
 }
 
@@ -969,7 +1039,7 @@ static void IRAM_ATTR dump_push_isr(char bus, uint32_t id, const uint8_t *d, int
 }
 
 /* settings menu: turn = move (or change the value in edit mode), press = select/confirm, hold = back to DRIVE */
-enum { MI_BRIGHT, MI_CC_STEP, MI_AUTOLOCK, MI_GRAPH_PARAM, MI_GRAPH_SPAN, MI_FUEL_CAL, MI_TANK, MI_TRIP_RESET, MI_DUMP, MI_EXIT, NMENU };
+enum { MI_BRIGHT, MI_AUTOLOCK, MI_GRAPH_PARAM, MI_GRAPH_SPAN, MI_FUEL_CAL, MI_TANK, MI_TRIP_RESET, MI_DUMP, MI_EXIT, NMENU };
 #define MENU_ROWS 4
 static int menu_sel, menu_top;
 static bool menu_edit;
@@ -987,9 +1057,8 @@ static void menu_leave(void)
 
 static void menu_rotate(int steps)
 {
-    if (menu_edit) {                                     /* BRIGHT, CC STEP are editable */
+    if (menu_edit) {                                     /* BRIGHT, GR PARAM, GR SPAN, FUEL CAL are editable */
         if (menu_sel == MI_BRIGHT) { bright = clampi(bright + 10 * steps, 10, 100); backlight_set(bright); }
-        else if (menu_sel == MI_CC_STEP) cc_step = clampi(cc_step + steps, 1, 5);
         else if (menu_sel == MI_FUEL_CAL) fuel_ul = clampi(fuel_ul + 5 * steps, 20, 400);
         else if (menu_sel == MI_GRAPH_PARAM) { g_param = ((g_param + steps) % NPARAM + NPARAM) % NPARAM; graph_clear(graph_first()); }
         else if (menu_sel == MI_GRAPH_SPAN) {
@@ -1010,7 +1079,6 @@ static void menu_press(void)
 {
     switch (menu_sel) {
     case MI_BRIGHT:
-    case MI_CC_STEP:
     case MI_FUEL_CAL:
     case MI_GRAPH_PARAM:
     case MI_GRAPH_SPAN:
@@ -1042,7 +1110,7 @@ static void menu_press(void)
 
 static void draw_menu(void)
 {
-    static const char *const label[NMENU] = { "BRIGHT", "CC STEP", "AUTO LOCK", "GR PARAM", "GR SPAN", "FUEL CAL", "TANK L", "TRIP RESET", "CAN DUMP", "EXIT" };
+    static const char *const label[NMENU] = { "BRIGHT", "AUTO LOCK", "GR PARAM", "GR SPAN", "FUEL CAL", "TANK L", "TRIP RESET", "CAN DUMP", "EXIT" };
     char v[24];
     for (int r = 0; r < MENU_ROWS; r++) {
         const int i = menu_top + r;
@@ -1052,7 +1120,6 @@ static void draw_menu(void)
         draw_text(10, y + 2, 2, sel ? WHITE : GRAY, label[i]);
         v[0] = 0;
         if (i == MI_BRIGHT) snprintf(v, sizeof(v), "%d%%", bright);
-        else if (i == MI_CC_STEP) snprintf(v, sizeof(v), "%d", cc_step);
         else if (i == MI_AUTOLOCK) snprintf(v, sizeof(v), "%s", al_on ? "ON" : "OFF");
         else if (i == MI_GRAPH_PARAM) snprintf(v, sizeof(v), "%s", graph_first() < 0 ? "-" : g_param ? PARAMS[g_param].label : "CFG");
         else if (i == MI_GRAPH_SPAN) { if (graph_first() < 0) snprintf(v, sizeof(v), "-"); else if (g_span) snprintf(v, sizeof(v), "%ds", g_span); else snprintf(v, sizeof(v), "CFG"); }
@@ -1150,14 +1217,25 @@ static void hs_task(void *arg)
     for (int i = 0; i < SCREEN_COUNT; i++) all |= screen_pid_mask(i);
     size_t pid_i = 0, bg_i = 0;
     bool turn_shown = true;
+    uint8_t tp[64];                                      /* Mode 03 payload after the 0x43 byte (ISO-TP reassembly) */
+    int tp_len = 0, tp_got = 0;
+    TickType_t dtc_t0 = 0;
     TickType_t next_req = 0;
     int unanswered = 0;
     uint32_t n_sent = 0, n_ans = 0, n_busy = 0;
     while (1) {
         xSemaphoreTake(mcp2515_rx_sem(), pdMS_TO_TICKS(50));
         const TickType_t tn = xTaskGetTickCount();
+        if (dtc_state == DTC_REQ) {                      /* one read-only request: service 03, stored codes */
+            const uint8_t rq[8] = { 0x02, 0x03, 0, 0, 0, 0, 0, 0 };
+            tp_len = tp_got = 0;
+            if (mcp2515_send(0x7DF, rq, 8)) { dtc_state = DTC_WAIT; dtc_t0 = tn; ESP_LOGI(TAG, "DTC: Mode 03 requested"); }
+        } else if (dtc_state == DTC_WAIT && tn - dtc_t0 > pdMS_TO_TICKS(2500)) {
+            dtc_state = DTC_FAIL;
+            ESP_LOGW(TAG, "DTC: no answer");
+        }
         const uint16_t shown = screen_pid_mask(screen);
-        if (all && car_live && (int32_t)(tn - next_req) >= 0) {
+        if (all && car_live && dtc_state != DTC_REQ && dtc_state != DTC_WAIT && (int32_t)(tn - next_req) >= 0) {
             const uint16_t mask = (turn_shown && shown) ? shown : all;
             size_t *idx = (turn_shown && shown) ? &pid_i : &bg_i;
             for (int t = 0; t < NQ && !(mask >> *idx & 1); t++) *idx = (*idx + 1) % NQ;
@@ -1197,6 +1275,40 @@ static void hs_task(void *arg)
                 }
                 unanswered = 0;
                 n_ans++;
+            }
+            if (dtc_state == DTC_WAIT && f.id == 0x7E8 && !f.ext && !f.rtr && f.dlc >= 3) {
+                const uint8_t pci = f.data[0] >> 4;
+                bool done = false;
+                if (pci == 0 && f.data[1] == 0x43) {                         /* single frame: 03 43 .. */
+                    tp_len = f.data[0] - 1 < 7 ? f.data[0] - 1 : 6;
+                    memcpy(tp, &f.data[2], tp_len);
+                    tp_got = tp_len;
+                    done = true;
+                } else if (pci == 0 && f.data[1] == 0x7F && f.data[2] == 0x03) {   /* negative response */
+                    dtc_n = 0;
+                    dtc_state = DTC_FAIL;
+                } else if (pci == 1 && f.dlc >= 8 && f.data[2] == 0x43) {    /* first frame: ask for the rest */
+                    tp_len = (((f.data[0] & 0x0F) << 8) | f.data[1]) - 1;
+                    if (tp_len > (int)sizeof(tp)) tp_len = sizeof(tp);
+                    tp_got = 0;
+                    for (int i = 3; i < 8 && tp_got < tp_len; i++) tp[tp_got++] = f.data[i];
+                    const uint8_t fc[8] = { 0x30, 0x00, 0x00, 0, 0, 0, 0, 0 };
+                    mcp2515_send(0x7E0, fc, 8);
+                    done = tp_got >= tp_len;
+                } else if (pci == 2 && tp_len > 0) {                         /* consecutive frame */
+                    for (int i = 1; i < 8 && tp_got < tp_len; i++) tp[tp_got++] = f.data[i];
+                    done = tp_got >= tp_len;
+                }
+                if (done) {                                                  /* [count] then 2 bytes per code */
+                    int k = (tp_got & 1) ? 1 : 0, n = 0;
+                    for (; k + 1 < tp_got && n < (int)(sizeof(dtc_raw) / sizeof(dtc_raw[0])); k += 2) {
+                        const uint16_t raw = tp[k] << 8 | tp[k + 1];
+                        if (raw) dtc_raw[n++] = raw;
+                    }
+                    dtc_n = n;
+                    dtc_state = DTC_DONE;
+                    ESP_LOGI(TAG, "DTC: %d code(s)", n);
+                }
             }
             if (dump_on && !f.ext && !f.rtr && f.dlc) {
                 dump_msg_t m = { .bus = 'H', .dlc = f.dlc, .id = f.id };
@@ -1507,8 +1619,8 @@ void app_main(void)
             char c = (char)rx[i];
             if (c == '\n') {
                 line[n] = 0;
-                if (line[0] == 'N' && screen != SCR_MENU) screen = (screen + 1) % NCYCLE;
-                else if (line[0] == 'P') { ui_preview = (ui_preview + 1) % 4; ui_preview_tick = now; }
+                if (line[0] == 'N' && screen != SCR_MENU && screen != SCR_DTC) screen = (screen + 1) % NCYCLE;
+                else if (line[0] == 'P' && ENABLE_CRUISE) { ui_preview = (ui_preview + 1) % 4; ui_preview_tick = now; }
                 else if (line[0] == 'F') fb_dump = true;
                 else if (line[0] == 'O') ui_doors = (ui_doors + 1) % 6;
                 else if (line[0] == 'S') cruise_toggle();
@@ -1530,6 +1642,7 @@ void app_main(void)
             enc_acc -= steps * ENC_TRANS;
             if (btn_prev) long_done = true;              /* turned while held: not a click, not a 5 s hold */
             if (screen == SCR_MENU) menu_rotate(steps);
+            else if (screen == SCR_DTC) dtc_top = clampi(dtc_top + steps, 0, dtc_n > 5 ? dtc_n - 5 : 0);
             else if (btn_prev && cc_active) cruise_adjust(cc_step * steps);   /* held + turn: set speed */
             else screen = ((screen + steps) % NCYCLE + NCYCLE) % NCYCLE;
         }
@@ -1537,6 +1650,7 @@ void app_main(void)
         bool pressed = gpio_get_level(PIN_BTN) == 0 || gpio_get_level(PIN_ENC_SW) == 0;
         if (pressed && !btn_prev) { press_t = now; long_done = false; }
         uint32_t held = pressed ? pdTICKS_TO_MS(now - press_t) : 0;
+        btn_held_ms = (pressed && !long_done) ? held : 0;
         if (pressed && !long_done) {
             if (screen == SCR_MENU && held >= LONG_MS) {
                 long_done = true;                        /* hold in the menu: back to DRIVE */
@@ -1549,10 +1663,14 @@ void app_main(void)
             }
         }
         if (!pressed && btn_prev && !long_done) {
+            const uint32_t rel = pdTICKS_TO_MS(now - press_t);
             if (screen == SCR_MENU) menu_press();
-            else cruise_toggle();                        /* click (released before 5 s): cruise set/cancel */
+            else if (rel >= DTC_MS) { dtc_start(); screen = SCR_DTC; }   /* released after 3..5 s: read the fault codes */
+            else if (screen == SCR_DTC) screen = SCR_DRIVE;              /* click: leave the list */
+            else cruise_toggle();                        /* click: nothing while ENABLE_CRUISE is 0 */
         }
         btn_prev = pressed;
+        if ((dtc_state == DTC_REQ || dtc_state == DTC_WAIT) && now - dtc_t_start > pdMS_TO_TICKS(4000)) dtc_state = DTC_FAIL;   /* HS-CAN missing or silent */
 
         car_live = can_seen && (now - last_can) < pdMS_TO_TICKS(STALE_MS);
 
