@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Конструктор екранів OBC</title>
+<style>
+  :root {
+    --bg: #f4f6f9; --panel: #ffffff; --ink: #14202e; --muted: #5b6b7c; --line: #d5dce5;
+    --accent: #1565c0; --accent-ink: #ffffff; --warn: #b26a00; --bad: #c62828; --ok: #2e7d32;
+    --code-bg: #0f1b2a; --code-ink: #d6e4f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0e151e; --panel: #172230; --ink: #e6edf5; --muted: #9db0c4; --line: #2a3a4d;
+      --accent: #64a8ff; --accent-ink: #06121f; --warn: #ffb74d; --bad: #ff8a80; --ok: #81c784;
+      --code-bg: #0a1018; --code-ink: #cfe0f3;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 14px 16px 6px; max-width: 1280px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  header p { margin: 0; color: var(--muted); }
+  main { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 14px; padding: 10px 16px 28px; max-width: 1280px; margin: 0 auto; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 8px; }
+  .col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+  .thumb { display: block; width: 100%; image-rendering: pixelated; border: 2px solid transparent; border-radius: 4px; cursor: pointer; }
+  .thumb.sel { border-color: var(--accent); }
+  .thumbrow { margin-bottom: 8px; }
+  .thumbrow small { color: var(--muted); display: block; margin-bottom: 2px; }
+  button, select, input, textarea { font: inherit; color: inherit; }
+  button { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  input, select { background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 4px 6px; }
+  input[type=number] { width: 64px; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .row label { display: flex; gap: 5px; align-items: center; color: var(--muted); }
+  .stage { position: relative; width: 100%; max-width: 852px; }
+  .stage canvas { display: block; width: 100%; image-rendering: pixelated; border-radius: 4px; }
+  .cells { position: absolute; inset: 0; }
+  .cell { position: absolute; cursor: pointer; border: 2px solid transparent; }
+  .cell:hover { border-color: rgba(255,255,255,.45); }
+  .cell.sel { border-color: #fff; box-shadow: 0 0 0 1px #000 inset; }
+  .msgs { margin: 8px 0 0; padding: 0; list-style: none; }
+  .msgs li { padding: 2px 0; }
+  .msgs .bad { color: var(--bad); } .msgs .warn { color: var(--warn); } .msgs .ok { color: var(--ok); }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 3px 4px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td input[type=text] { width: 120px; }
+  td input[type=number] { width: 72px; }
+  .id { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  .badge { font-size: 11px; color: var(--accent); }
+  .badgeobd { font-size: 11px; color: var(--warn); }
+  textarea { width: 100%; height: 260px; background: var(--code-bg); color: var(--code-ink); border-radius: 6px; border: 1px solid var(--line); padding: 8px; font: 12px/1.4 ui-monospace, Menlo, monospace; white-space: pre; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .tablewrap { overflow-x: auto; max-height: 420px; overflow-y: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Конструктор екранів OBC</h1>
+  <p>Дисплей 284×76 з тим самим шрифтом і розкладкою, що в прошивці. Налаштуй екрани, скопіюй результат у <code>main/screens.h</code>, збери й прошив.</p>
+</header>
+<main>
+  <div class="col">
+    <section>
+      <h2>Екрани</h2>
+      <div id="thumbs"></div>
+      <div class="row">
+        <button id="addScreen">+ екран</button>
+        <button id="delScreen">видалити</button>
+      </div>
+      <div class="row">
+        <button id="upScreen">↑ вгору</button>
+        <button id="downScreen">↓ вниз</button>
+      </div>
+      <div class="hint">Перший екран — DRIVE, він завжди першим. Меню додається після всіх, утриманням кнопки.</div>
+    </section>
+  </div>
+
+  <div class="col">
+    <section>
+      <h2>Вибраний екран</h2>
+      <div class="row" id="screenProps"></div>
+      <div class="stage"><canvas id="main" width="284" height="76"></canvas><div class="cells" id="cells"></div></div>
+      <div class="row" style="margin-top:10px" id="cellProps"></div>
+      <ul class="msgs" id="msgs"></ul>
+    </section>
+
+    <section>
+      <h2>Параметри: підписи, пороги, демо-значення</h2>
+      <div class="hint" style="margin:0 0 6px">Пороги й демо — у сирих одиницях параметра (див. колонку «одиниця»). Порожнє поле = без межі. Жовтий за межами warn, червоний за межами alarm.</div>
+      <div class="tablewrap"><table id="params"></table></div>
+    </section>
+
+    <section>
+      <h2>screens.h</h2>
+      <div class="row">
+        <button class="primary" id="copy">Копіювати</button>
+        <button id="download">Завантажити screens.h</button>
+        <button id="import">Завантажити з тексту нижче</button>
+        <button id="reset">Скинути до стандартних</button>
+      </div>
+      <textarea id="out" spellcheck="false"></textarea>
+      <div class="hint" id="status"></div>
+      <div class="hint">Щоб відредагувати наявний файл: встав вміст <code>main/screens.h</code> у поле й натисни «Завантажити з тексту». Стан зберігається в браузері.</div>
+    </section>
+  </div>
+</main>
+
+<script>
+"use strict";
+const W = 284, H = 76;
+
+/* ---- font: copy of font[] from main/main.c (5 columns, bit0 = top row) ---- */
+const FONT = {
+  '0':[0x3E,0x51,0x49,0x45,0x3E],'1':[0x00,0x42,0x7F,0x40,0x00],'2':[0x42,0x61,0x51,0x49,0x46],'3':[0x21,0x41,0x45,0x4B,0x31],
+  '4':[0x18,0x14,0x12,0x7F,0x10],'5':[0x27,0x45,0x45,0x45,0x39],'6':[0x3C,0x4A,0x49,0x49,0x30],'7':[0x01,0x71,0x09,0x05,0x03],
+  '8':[0x36,0x49,0x49,0x49,0x36],'9':[0x06,0x49,0x49,0x29,0x1E],'.':[0x00,0x60,0x60,0x00,0x00],'%':[0x23,0x13,0x08,0x64,0x62],
+  '-':[0x08,0x08,0x08,0x08,0x08],'A':[0x7E,0x11,0x11,0x11,0x7E],'B':[0x7F,0x49,0x49,0x49,0x36],'C':[0x3E,0x41,0x41,0x41,0x22],
+  'D':[0x7F,0x41,0x41,0x22,0x1C],'K':[0x7F,0x08,0x14,0x22,0x41],'M':[0x7F,0x02,0x0C,0x02,0x7F],'N':[0x7F,0x04,0x08,0x10,0x7F],
+  'O':[0x3E,0x41,0x41,0x41,0x3E],'P':[0x7F,0x09,0x09,0x09,0x06],'R':[0x7F,0x09,0x19,0x29,0x46],'T':[0x01,0x01,0x7F,0x01,0x01],
+  'U':[0x3F,0x40,0x40,0x40,0x3F],'X':[0x63,0x14,0x08,0x14,0x63],'E':[0x7F,0x49,0x49,0x49,0x41],'F':[0x7F,0x09,0x09,0x09,0x01],
+  'G':[0x3E,0x41,0x49,0x49,0x7A],'H':[0x7F,0x08,0x08,0x08,0x7F],'I':[0x00,0x41,0x7F,0x41,0x00],'L':[0x7F,0x40,0x40,0x40,0x40],
+  'S':[0x46,0x49,0x49,0x49,0x31],'V':[0x1F,0x20,0x40,0x20,0x1F],'W':[0x3F,0x40,0x38,0x40,0x3F],'Y':[0x07,0x08,0x70,0x08,0x07],
+  ':':[0x00,0x36,0x36,0x00,0x00],'/':[0x20,0x10,0x08,0x04,0x02]
+};
+const COLORS = { GRAY: '#cde1fa', WHITE: '#ffffff', DIM: '#001c54', AMBER: '#ffbe00', RED: '#ff4646' };
+
+/* ---- parameters: order = enum in screens.h ---- */
+const META = [
+  ['SPEED',     'km/h', 0, 87], ['RPM', 'rpm', 0, 2400], ['COOL', 'degC, coolant (MS-CAN)', 0, 92], ['VOLT', '0.1 V', 1, 140],
+  ['GAS', '% pedal', 0, 12], ['TRIP_KM', '0.1 km', 1, 123], ['TRIP_TIME', 's, shown h:mm', 0, 3725],
+  ['AVG', 'km/h, trip average', 0, 54], ['MAX_SPEED', 'km/h', 0, 131], ['MAX_RPM', 'rpm', 0, 4800],
+  ['CLOCK', 'min since midnight, shown hh:mm (car clock)', 0, 872], ['FUEL_L', '0.1 L burned this trip', 1, 48],
+  ['L100', '0.1 L/100 km, trip average', 1, 71], ['LEFT_L', '0.1 L, tank estimate from 0x499 (zero point assumed)', 1, 173],
+  ['LPH', '0.1 L/h, instant', 1, 12], ['L100I', '0.1 L/100 km, instant (needs >= 10 km/h)', 1, 68],
+  ['MAP', 'kPa, intake pressure (MS-CAN 0x420 d7)', 0, 31], ['IAT', 'degC [OBD]', 0, 36], ['TIMING', '0.1 deg [OBD], ignition advance', 1, 40],
+  ['STFT', '0.1 % [OBD], short-term fuel trim', 1, -39], ['LTFT', '0.1 % [OBD], long-term fuel trim', 1, -140],
+  ['TRIM', '0.1 % [OBD], STFT + LTFT', 1, -179], ['O2A', '0.01 V [OBD], lambda sensor before the catalyst (B1S1)', 2, 69],
+  ['O2B', '0.01 V [OBD], lambda sensor after the catalyst (B1S2)', 2, 61], ['LOAD', '% [OBD], calculated engine load', 0, 26],
+  ['ECT', 'degC [OBD], coolant as the PCM sees it', 0, 89], ['THR', '% [OBD], throttle position', 0, 4],
+  ['FSYS', '[OBD] CL = closed loop, OL = open loop', 0, 2], ['DTC', '[OBD] stored fault codes; "n MIL" when the check-engine lamp is on', 0, 0]
+].map(([id, unit, dec, demo]) => ({ id, unit, dec, demo }));
+const PID = Object.fromEntries(META.map((m, i) => [m.id, i + 1]));   // P_NONE = 0
+const isObd = m => /\[OBD\]/.test(m.unit);
+const byIndex = i => META[i - 1];
+
+const DEFAULTS = {
+  params: {
+    SPEED: ['KM/H', null, null, null, null], RPM: ['RPM', null, 5500, null, 6200], COOL: ['COOL C', null, 100, null, 108],
+    VOLT: ['VOLT', 125, 148, 118, 155], GAS: ['GAS %', null, null, null, null], TRIP_KM: ['TRIP KM', null, null, null, null],
+    TRIP_TIME: ['TIME', null, null, null, null], AVG: ['AVG KM/H', null, null, null, null], MAX_SPEED: ['MAX KM/H', null, null, null, null],
+    MAX_RPM: ['MAX RPM', null, null, null, null], CLOCK: ['CLOCK', null, null, null, null], FUEL_L: ['FUEL L', null, null, null, null],
+    L100: ['L/100', null, null, null, null], LEFT_L: ['LEFT L', 80, null, 50, null], LPH: ['L/H', null, null, null, null],
+    L100I: ['L/100 NOW', null, null, null, null], MAP: ['MAP KPA', null, null, null, null], IAT: ['IAT C', null, 60, null, 80],
+    TIMING: ['TIMING', null, null, null, null], STFT: ['STFT %', -100, 100, -250, 250], LTFT: ['LTFT %', -100, 100, -200, 200],
+    TRIM: ['TRIM %', -150, 150, -250, 250], O2A: ['O2 B1S1 V', null, null, null, null], O2B: ['O2 B1S2 V', null, null, null, null],
+    LOAD: ['LOAD %', null, null, null, null], ECT: ['ECT C', null, 100, null, 108], THR: ['THR %', null, null, null, null],
+    FSYS: ['FUEL SYS', null, null, null, null], DTC: ['DTC', null, null, null, 0]
+  },
+  screens: [
+    { name: 'DRIVE', kind: 'DRIVE', cols: 0, rows: 0, scale: 0, items: [] },
+    { name: 'TRIP', kind: 'GRID', cols: 3, rows: 2, scale: 3, items: ['TRIP_KM', 'TRIP_TIME', 'AVG', 'MAX_SPEED', 'MAX_RPM', 'CLOCK'] },
+    { name: 'FUEL', kind: 'GRID', cols: 3, rows: 1, scale: 4, items: ['FUEL_L', 'L100', 'LEFT_L'] },
+    { name: 'ENG', kind: 'GRID', cols: 3, rows: 2, scale: 3, items: ['MAP', 'IAT', 'TIMING', 'STFT', 'LTFT', 'O2A'] },
+    { name: 'ENG 2', kind: 'GRID', cols: 3, rows: 2, scale: 3, items: ['LOAD', 'ECT', 'THR', 'O2B', 'FSYS', 'DTC'] }
+  ]
+};
+
+let state = load() || clone(DEFAULTS);
+let demo = Object.fromEntries(META.map(m => [m.id, m.demo]));
+let selScreen = 1, selCell = 0;
+
+function clone(o) { return JSON.parse(JSON.stringify(o)); }
+function load() {
+  try { const s = JSON.parse(localStorage.getItem('obc-screens')); if (s && s.screens && s.params) return s; } catch (e) {}
+  return null;
+}
+function save() { try { localStorage.setItem('obc-screens', JSON.stringify(state)); } catch (e) {} }
+
+/* ---- value formatting and levels: mirror param_text()/param_level() in main/main.c ---- */
+function fmt(id, v) {
+  const m = META[PID[id] - 1];
+  if (id === 'TRIP_TIME') return Math.trunc(v / 3600) + ':' + String(Math.trunc(v / 60) % 60).padStart(2, '0');
+  if (id === 'CLOCK') return String(Math.trunc(v / 60)).padStart(2, '0') + ':' + String(v % 60).padStart(2, '0');
+  if (id === 'FSYS') return (v & 0x12) ? 'CL' : 'OL';
+  if (id === 'DTC') return (v & 0x100) ? (v & 0x7F) + ' MIL' : String(v & 0x7F);
+  if (!m.dec) return String(v);
+  const p = m.dec === 1 ? 10 : 100, a = Math.abs(v);
+  return (v < 0 ? '-' : '') + Math.trunc(a / p) + '.' + String(a % p).padStart(m.dec, '0');
+}
+function level(id, v) {
+  const c = state.params[id];
+  if (id === 'DTC') v &= 0x7F;
+  if ((c[3] !== null && v < c[3]) || (c[4] !== null && v > c[4])) return 2;
+  if ((c[1] !== null && v < c[1]) || (c[2] !== null && v > c[2])) return 1;
+  return 0;
+}
+
+/* ---- drawing, same geometry as draw_grid() ---- */
+const textW = (s, sc) => s.length * 6 * sc - sc;
+function drawText(ctx, x, y, sc, color, s) {
+  ctx.fillStyle = color;
+  for (const ch of s) {
+    const g = FONT[ch];
+    if (g) for (let cx = 0; cx < 5; cx++) for (let cy = 0; cy < 7; cy++) if (g[cx] & (1 << cy)) ctx.fillRect(x + cx * sc, y + cy * sc, sc, sc);
+    x += 6 * sc;
+  }
+}
+function geometry(s) {
+  let cols = s.cols || 3, rows = s.rows || 1;
+  while (cols * rows > 6) rows--;
+  return { cols, rows, cw: Math.trunc(W / cols), ch: Math.trunc(H / rows) };
+}
+function drawScreen(canvas, s) {
+  const ctx = canvas.getContext('2d');
+  for (let y = 0; y < H; y++) {
+    ctx.fillStyle = `rgb(${Math.trunc(y * 5 / H)},${45 + Math.trunc(y * 50 / H)},${130 + Math.trunc(y * 80 / H)})`;
+    ctx.fillRect(0, y, W, 1);
+  }
+  if (s.kind === 'DRIVE') {
+    drawText(ctx, 8, 8, 2, COLORS.WHITE, 'DRIVE');
+    drawText(ctx, 8, 30, 1, COLORS.GRAY, 'FIXED GAUGE LAYOUT');
+    drawText(ctx, 8, 42, 1, COLORS.GRAY, 'RPM BAR  SPEED  CHIPS');
+    return;
+  }
+  const g = geometry(s);
+  for (let k = 0; k < g.cols * g.rows; k++) {
+    const id = s.items[k];
+    if (!id || !PID[id]) continue;
+    const x = 4 + (k % g.cols) * g.cw, y = Math.trunc(k / g.cols) * g.ch;
+    const v = demo[id], text = fmt(id, v), lvl = level(id, v);
+    let sc = s.scale || 3;
+    while (sc > 1 && (textW(text, sc) > g.cw - 8 || 7 + 4 + 7 * sc > g.ch - 2)) sc--;
+    const top = y + Math.trunc((g.ch - (7 + 4 + 7 * sc)) / 2);
+    drawText(ctx, x, top, 1, COLORS.GRAY, state.params[id][0]);
+    drawText(ctx, x, top + 11, sc, lvl === 2 ? COLORS.RED : lvl === 1 ? COLORS.AMBER : COLORS.WHITE, text);
+  }
+  ctx.fillStyle = COLORS.DIM;
+  for (let i = 1; i < g.cols; i++) ctx.fillRect(i * g.cw - 1, 2, 1, H - 4);
+  for (let i = 1; i < g.rows; i++) ctx.fillRect(4, i * g.ch, W - 8, 1);
+}
+
+/* ---- validation ---- */
+function check() {
+  const msgs = [];
+  const s = state.screens[selScreen];
+  if (state.screens[0].kind !== 'DRIVE') msgs.push(['bad', 'Перший екран має бути DRIVE.']);
+  if (s.kind === 'GRID') {
+    if ((s.cols || 3) * (s.rows || 1) > 6) msgs.push(['bad', 'Клітинок більше 6: прошивка обріже сітку.']);
+    const used = [];
+    const g = geometry(s);
+    for (let k = 0; k < g.cols * g.rows; k++) if (!s.items[k]) used.push(k + 1);
+    if (used.length) msgs.push(['warn', 'Порожні клітинки: ' + used.join(', ') + '.']);
+    for (let k = 0; k < g.cols * g.rows; k++) {
+      const id = s.items[k];
+      if (!id) continue;
+      const v = fmt(id, demo[id]);
+      const sc = s.scale || 3;
+      if (textW(v, sc) > g.cw - 8 || 7 + 4 + 7 * sc > g.ch - 2) msgs.push(['warn', `Клітинка ${k + 1} (${id}): значення не вміщається на масштабі ${sc}, прошивка зменшить шрифт.`]);
+    }
+    if (s.items.some(i => i && isObd(byIndex(PID[i])))) msgs.push(['ok', 'Є параметри з OBD: плата запитує їх у PCM лише поки цей екран показується.']);
+  }
+  for (const m of META) {
+    const bad = [...state.params[m.id][0]].filter(c => c !== ' ' && !FONT[c]);
+    if (bad.length) msgs.push(['bad', `Підпис ${m.id}: у шрифті немає символів «${[...new Set(bad)].join('')}». Їх прошивка пропустить, спершу додай у font[].`]);
+  }
+  if (!msgs.length) msgs.push(['ok', 'Зауважень немає.']);
+  return msgs;
+}
+
+/* ---- export / import ---- */
+const pad = (s, n) => s + ' '.repeat(Math.max(0, n - s.length));
+const lim = (v, none) => v === null ? none : String(v);
+function exportH() {
+  const out = [];
+  out.push(`#pragma once
+/*
+ * Screen layout: edit this file, \`idf.py build\`, flash. Nothing else needs to change.
+ * (Generated by tools/screen-designer.html; the same file can be loaded back into it.)
+ *
+ *  - SCREENS[]  list of screens in the order the encoder turns through them (the MENU always comes last,
+ *               entered by the 5 s hold). SCREENS[0] must be the DRIVE screen (door popup, cruise and the
+ *               menu EXIT work with it).
+ *  - A SK_GRID screen is cols x rows cells (cols * rows <= 6) filled from item[] left to right, top to bottom.
+ *    max_scale = biggest font scale (1..4, 0 = 3); a value that does not fit its cell is shrunk automatically.
+ *  - PARAMS[]   per parameter: the label printed above the value (incl. unit) and warning thresholds.
+ *    Thresholds are in the parameter's own raw unit (see the comment on each enum value); the value turns
+ *    AMBER outside warn_lo..warn_hi and RED outside alarm_lo..alarm_hi. NO_LO / NO_HI switch a limit off.
+ *  - Labels may use only the characters of font[] in main.c (digits . % - : / A-Z subset); a missing letter
+ *    is silently skipped, so add it to font[] first.
+ *  - Parameters marked [OBD] come from OBD-II requests to the PCM: they are asked for (read-only Mode 01) only
+ *    while a screen that shows them is on, and read "--" until the PCM answers.
+ */
+#include <limits.h>
+#include <stdint.h>
+
+enum {
+    P_NONE,         /* empty cell */`);
+  META.forEach(m => out.push(`    ${pad('P_' + m.id + ',', 15)} /* ${m.unit} */`));
+  out.push(`    NPARAM
+};
+
+#define NO_LO INT_MIN
+#define NO_HI INT_MAX
+
+typedef struct { const char *label; int warn_lo, warn_hi, alarm_lo, alarm_hi; } param_cfg_t;
+
+/* every parameter has to be listed */
+static const param_cfg_t PARAMS[NPARAM] = {`);
+  META.forEach(m => {
+    const c = state.params[m.id];
+    out.push(`    ${pad('[P_' + m.id + ']', 15)} = { ${pad('"' + c[0] + '",', 13)} ${pad(lim(c[1], 'NO_LO') + ',', 6)} ${pad(lim(c[2], 'NO_HI') + ',', 6)} ${pad(lim(c[3], 'NO_LO') + ',', 6)} ${lim(c[4], 'NO_HI')} },`);
+  });
+  out.push(`};
+
+enum { SK_DRIVE, SK_GRID };
+
+typedef struct {
+    const char *name;           /* for the log only */
+    uint8_t kind;               /* SK_DRIVE (fixed gauge layout) or SK_GRID */
+    uint8_t cols, rows;         /* SK_GRID: 1..3 x 1..2 and so on, cols * rows <= 6 */
+    uint8_t max_scale;          /* SK_GRID: biggest font scale, 0 = 3 */
+    uint8_t item[6];            /* SK_GRID: P_* per cell */
+} screen_cfg_t;
+
+static const screen_cfg_t SCREENS[] = {`);
+  state.screens.forEach(s => {
+    if (s.kind === 'DRIVE') { out.push(`    { "${s.name}", SK_DRIVE, 0, 0, 0, { 0 } },`); return; }
+    let n = s.items.length;
+    while (n && !s.items[n - 1]) n--;
+    const items = s.items.slice(0, n).map(i => i ? 'P_' + i : 'P_NONE').join(', ');
+    out.push(`    { ${pad('"' + s.name + '",', 9)} SK_GRID, ${s.cols}, ${s.rows}, ${s.scale}, { ${items || '0'} } },`);
+  });
+  out.push('};', '');
+  return out.join('\n');
+}
+function importH(text) {
+  const params = clone(state.params), screens = [];
+  const lim2 = t => /^NO_(LO|HI)$/.test(t) ? null : parseInt(t, 10);
+  for (const m of text.matchAll(/\[P_(\w+)\]\s*=\s*\{\s*"([^"]*)"\s*,\s*([-\w]+)\s*,\s*([-\w]+)\s*,\s*([-\w]+)\s*,\s*([-\w]+)\s*\}/g)) {
+    if (!PID[m[1]]) continue;
+    params[m[1]] = [m[2], lim2(m[3]), lim2(m[4]), lim2(m[5]), lim2(m[6])];
+  }
+  const tail = text.slice(Math.max(0, text.indexOf('SCREENS[]')));
+  for (const m of tail.matchAll(/\{\s*"([^"]*)"\s*,\s*SK_(DRIVE|GRID)(?:\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*\{([^}]*)\})?/g)) {
+    if (m[2] === 'DRIVE') { screens.push({ name: m[1], kind: 'DRIVE', cols: 0, rows: 0, scale: 0, items: [] }); continue; }
+    const items = (m[6] || '').split(',').map(t => t.trim().replace(/^P_/, '')).map(t => PID[t] ? t : null);
+    while (items.length < 6) items.push(null);
+    screens.push({ name: m[1], kind: 'GRID', cols: +m[3], rows: +m[4], scale: +m[5], items: items.slice(0, 6) });
+  }
+  if (!screens.length) throw new Error('У тексті не знайдено SCREENS[].');
+  state = { params, screens };
+  selScreen = Math.min(1, screens.length - 1); selCell = 0;
+}
+
+/* ---- UI ---- */
+const $ = id => document.getElementById(id);
+function el(tag, props, ...kids) {
+  const e = Object.assign(document.createElement(tag), props || {});
+  kids.forEach(k => e.append(k));
+  return e;
+}
+function numField(value, onchange, min, max) {
+  const i = el('input', { type: 'number', value: value === null ? '' : value, min, max });
+  i.oninput = () => onchange(i.value === '' ? null : parseInt(i.value, 10));
+  return i;
+}
+
+function renderThumbs() {
+  const box = $('thumbs'); box.replaceChildren();
+  state.screens.forEach((s, i) => {
+    const c = el('canvas', { width: W, height: H, className: 'thumb' + (i === selScreen ? ' sel' : '') });
+    c.onclick = () => { selScreen = i; selCell = 0; renderAll(); };
+    drawScreen(c, s);
+    box.append(el('div', { className: 'thumbrow' }, el('small', { textContent: `${i + 1}. ${s.name}` }), c));
+  });
+}
+function renderEditor() {
+  const s = state.screens[selScreen];
+  drawScreen($('main'), s);
+  const props = $('screenProps'); props.replaceChildren();
+  const name = el('input', { type: 'text', value: s.name, maxLength: 12 });
+  name.oninput = () => { s.name = name.value; save(); renderThumbs(); renderOut(); };
+  props.append(el('label', {}, 'назва ', name));
+  const cells = $('cells'); cells.replaceChildren();
+  const cp = $('cellProps'); cp.replaceChildren();
+  if (s.kind === 'DRIVE') {
+    props.append(el('span', { className: 'hint', textContent: 'DRIVE має фіксований макет, його вміст тут не налаштовується.' }));
+    return;
+  }
+  const mk = (label, key, min, max) => { const f = numField(s[key], v => { s[key] = v === null ? 0 : v; save(); renderAll(true); }, min, max); f.value = s[key]; props.append(el('label', {}, label + ' ', f)); };
+  mk('колонок', 'cols', 1, 6); mk('рядків', 'rows', 1, 6); mk('макс. масштаб шрифту', 'scale', 0, 4);
+  const g = geometry(s);
+  for (let k = 0; k < g.cols * g.rows; k++) {
+    const d = el('div', { className: 'cell' + (k === selCell ? ' sel' : '') });
+    d.style.left = (((k % g.cols) * g.cw) / W * 100) + '%';
+    d.style.top = (Math.trunc(k / g.cols) * g.ch / H * 100) + '%';
+    d.style.width = (g.cw / W * 100) + '%'; d.style.height = (g.ch / H * 100) + '%';
+    d.onclick = () => { selCell = k; renderEditor(); };
+    cells.append(d);
+  }
+  if (selCell >= g.cols * g.rows) selCell = 0;
+  const sel = el('select');
+  sel.append(el('option', { value: '', textContent: '— порожньо —' }));
+  META.forEach(m => sel.append(el('option', { value: m.id, textContent: `${state.params[m.id][0]}  (${m.id})` })));
+  sel.value = s.items[selCell] || '';
+  sel.onchange = () => { s.items[selCell] = sel.value || null; while (s.items.length < 6) s.items.push(null); save(); renderAll(); };
+  cp.append(el('label', {}, `клітинка ${selCell + 1}: `, sel));
+  const id = s.items[selCell];
+  if (id) cp.append(el('span', { className: 'hint', textContent: byIndex(PID[id]).unit }));
+  const ul = $('msgs'); ul.replaceChildren();
+  check().forEach(([k, t]) => ul.append(el('li', { className: k, textContent: t })));
+}
+function renderParams() {
+  const t = $('params'); t.replaceChildren();
+  t.append(el('tr', {}, ...['параметр', 'підпис', 'warn ≤', 'warn ≥', 'alarm ≤', 'alarm ≥', 'демо', 'одиниця'].map(h => el('th', { textContent: h }))));
+  META.forEach(m => {
+    const c = state.params[m.id];
+    const label = el('input', { type: 'text', value: c[0], maxLength: 12 });
+    label.oninput = () => { c[0] = label.value.toUpperCase(); label.value = c[0]; save(); renderThumbs(); renderEditor(); renderOut(); };
+    const lim = i => numField(c[i], v => { c[i] = v; save(); renderThumbs(); renderEditor(); renderOut(); });
+    const dm = el('input', { type: 'number', value: demo[m.id] });
+    dm.oninput = () => { demo[m.id] = parseInt(dm.value || '0', 10); renderThumbs(); renderEditor(); };
+    const used = state.screens.filter(s => s.kind === 'GRID' && s.items.includes(m.id)).length;
+    t.append(el('tr', {},
+      el('td', {}, el('span', { className: 'id', textContent: m.id }), used ? el('span', { className: 'badge', textContent: ` · на ${used} екр.` }) : '', isObd(m) ? el('span', { className: 'badgeobd', textContent: ' OBD' }) : ''),
+      el('td', {}, label), el('td', {}, lim(1)), el('td', {}, lim(2)), el('td', {}, lim(3)), el('td', {}, lim(4)), el('td', {}, dm),
+      el('td', { className: 'hint', textContent: m.unit })));
+  });
+}
+function renderOut() { $('out').value = exportH(); }
+function renderAll(keepParams) { renderThumbs(); renderEditor(); if (!keepParams) renderParams(); renderOut(); }
+
+$('addScreen').onclick = () => {
+  state.screens.push({ name: 'NEW', kind: 'GRID', cols: 3, rows: 2, scale: 3, items: [null, null, null, null, null, null] });
+  selScreen = state.screens.length - 1; selCell = 0; save(); renderAll();
+};
+$('delScreen').onclick = () => {
+  if (selScreen === 0) return;
+  state.screens.splice(selScreen, 1); selScreen = Math.min(selScreen, state.screens.length - 1); selCell = 0; save(); renderAll();
+};
+$('upScreen').onclick = () => {
+  if (selScreen < 2) return;
+  [state.screens[selScreen - 1], state.screens[selScreen]] = [state.screens[selScreen], state.screens[selScreen - 1]];
+  selScreen--; save(); renderAll();
+};
+$('downScreen').onclick = () => {
+  if (selScreen === 0 || selScreen >= state.screens.length - 1) return;
+  [state.screens[selScreen + 1], state.screens[selScreen]] = [state.screens[selScreen], state.screens[selScreen + 1]];
+  selScreen++; save(); renderAll();
+};
+$('copy').onclick = async () => {
+  try { await navigator.clipboard.writeText($('out').value); $('copy').textContent = 'Скопійовано'; }
+  catch (e) { $('out').select(); document.execCommand('copy'); $('copy').textContent = 'Скопійовано'; }
+  setTimeout(() => $('copy').textContent = 'Копіювати', 1500);
+};
+$('download').onclick = () => {
+  const a = el('a', { href: URL.createObjectURL(new Blob([$('out').value], { type: 'text/plain' })), download: 'screens.h' });
+  a.click(); URL.revokeObjectURL(a.href);
+};
+$('import').onclick = () => {
+  try { importH($('out').value); save(); renderAll(); $('status').textContent = 'Завантажено.'; }
+  catch (e) { $('status').textContent = 'Помилка імпорту: ' + e.message; }
+};
+$('reset').onclick = () => { state = clone(DEFAULTS); selScreen = 1; selCell = 0; save(); renderAll(); };
+renderAll();
+</script>
+</body>
+</html>
