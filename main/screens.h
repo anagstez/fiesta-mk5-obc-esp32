@@ -118,6 +118,8 @@ static const screen_cfg_t SCREENS[] = {
     { "G L100", SK_GRAPH, 0, 0, 0, { P_L100I, P_SPEED, P_GAS }, 60 },                 /* what the pedal does to the consumption */
     { "G TEMP", SK_GRAPH, 0, 0, 0, { P_COOL, P_IAT }, 600 },                          /* warm-up curve */
     { "HEALTH", SK_GRID, 3, 2, 3, { P_COOL, P_VOLT, P_IAT, P_LOAD, P_TRIM, P_DTC }, 0 },   /* quick check: temps, battery, load, fuel trim, fault codes */
+    { "LAMBDA", SK_GRID, 3, 1, 4, { P_MAP, P_O2A, P_O2B }, 0 },                      /* intake pressure, lambda before and after the catalyst */
+    { "G LAMBDA", SK_GRAPH, 0, 0, 0, { P_O2A, P_MAP, P_STFT }, 60 },                   /* lambda switching vs MAP vs short-term trim */
     { "ENG",   SK_GRID, 3, 2, 3, { P_MAP, P_IAT, P_TIMING, P_STFT, P_LTFT, P_O2A }, 0 },
     { "ENG 2", SK_GRID, 3, 2, 3, { P_LOAD, P_ECT, P_THR, P_O2B, P_FSYS, P_DTC }, 0 },
     { "G SPEED", SK_GRAPH, 0, 0, 0, { P_SPEED }, 120 },
