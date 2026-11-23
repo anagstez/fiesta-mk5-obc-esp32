@@ -27,6 +27,11 @@ static const char *TAG = "mcp";
 
 #define MODE_CONFIG   0x80
 #define MODE_LISTEN   0x60
+#define MODE_NORMAL   0x00
+#define OSM           0x08           /* one-shot: a frame is sent once, no automatic retry */
+#define REG_TXB0CTRL  0x30
+#define CMD_LOAD_TX0  0x40           /* load TXB0 from SIDH */
+#define CMD_RTS_TX0   0x81
 #define INT_RX0       0x01
 #define INT_RX1       0x02
 #define INT_ERR       0x20
@@ -117,9 +122,10 @@ esp_err_t mcp2515_init(const mcp_cfg_t *cfg)
     reg_write(REG_CANINTE, INT_RX0 | INT_RX1);
     reg_write(REG_CANINTF, 0);
 
-    reg_write(REG_CANCTRL, MODE_LISTEN);
-    if ((reg_read(REG_CANSTAT) & 0xE0) != MODE_LISTEN) {
-        ESP_LOGE(TAG, "failed to enter listen-only mode");
+    const uint8_t mode = cfg->tx ? MODE_NORMAL : MODE_LISTEN;
+    reg_write(REG_CANCTRL, cfg->tx ? (MODE_NORMAL | OSM) : MODE_LISTEN);
+    if ((reg_read(REG_CANSTAT) & 0xE0) != mode) {
+        ESP_LOGE(TAG, "failed to enter %s mode", cfg->tx ? "normal" : "listen-only");
         return ESP_FAIL;
     }
 
@@ -131,12 +137,24 @@ esp_err_t mcp2515_init(const mcp_cfg_t *cfg)
     ESP_ERROR_CHECK(gpio_isr_handler_add(cfg->intr, on_int, NULL));
     xSemaphoreGive(rx_sem);          /* drain anything that arrived before the edge handler existed */
 
-    ESP_LOGI(TAG, "listen-only %lu bit/s, CNF=%02x/%02x/%02x", (unsigned long)cfg->bitrate, cnf1, cnf2, cnf3);
+    ESP_LOGI(TAG, "%s %lu bit/s, CNF=%02x/%02x/%02x", cfg->tx ? "normal one-shot" : "listen-only", (unsigned long)cfg->bitrate, cnf1, cnf2, cnf3);
     return ESP_OK;
 }
 
 SemaphoreHandle_t mcp2515_rx_sem(void) { return rx_sem; }
 uint32_t mcp2515_overflows(void) { return overflows; }
+
+bool mcp2515_send(uint32_t id, const uint8_t *data, uint8_t dlc)
+{
+    if (dlc > 8 || id > 0x7FF) return false;
+    if (reg_read(REG_TXB0CTRL) & 0x08) return false;         /* TXREQ still set: previous frame not gone yet */
+    uint8_t tx[14] = { CMD_LOAD_TX0, (uint8_t)(id >> 3), (uint8_t)((id & 7) << 5), 0, 0, dlc };
+    memcpy(tx + 6, data, dlc);
+    xfer(tx, NULL, 6 + dlc);
+    uint8_t rts = CMD_RTS_TX0;
+    xfer(&rts, NULL, 1);
+    return true;
+}
 
 bool mcp2515_read(mcp_frame_t *f)
 {
