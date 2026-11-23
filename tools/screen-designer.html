@@ -59,6 +59,7 @@
   .badgeobd { font-size: 11px; color: var(--warn); }
   textarea { width: 100%; height: 260px; background: var(--code-bg); color: var(--code-ink); border-radius: 6px; border: 1px solid var(--line); padding: 8px; font: 12px/1.4 ui-monospace, Menlo, monospace; white-space: pre; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .desc { color: var(--ink); font-size: 12px; margin-top: 2px; min-width: 260px; }
   .tablewrap { overflow-x: auto; max-height: 420px; overflow-y: auto; }
 </style>
 </head>
@@ -148,6 +149,37 @@ const META = [
   ['ECT', 'degC [OBD], coolant as the PCM sees it', 0, 89], ['THR', '% [OBD], throttle position', 0, 4],
   ['FSYS', '[OBD] CL = closed loop, OL = open loop', 0, 2], ['DTC', '[OBD] stored fault codes; "n MIL" when the check-engine lamp is on', 0, 0]
 ].map(([id, unit, dec, demo]) => ({ id, unit, dec, demo }));
+const DESC = {
+  SPEED: 'Швидкість авто за CAN (MS 0x201). Те саме число, що на панелі приладів.',
+  RPM: 'Оберти двигуна за хвилину (MS 0x201). Жовтий/червоний біля відсічки.',
+  COOL: 'Температура охолодної рідини з MS-CAN (0x420). Норма 85–100 °C, понад 108 — перегрів.',
+  VOLT: 'Напруга бортмережі (MS 0x428). Двигун працює: 13,8–14,5 В; нижче 11,8 В — не заряджає акумулятор.',
+  GAS: 'Положення педалі газу у відсотках (MS 0x201).',
+  TRIP_KM: 'Пробіг за поїздку, лічильник на платі. Скидається в меню TRIP RESET.',
+  TRIP_TIME: 'Час у русі за поїздку, формат г:хх. Скидається разом з поїздкою.',
+  AVG: 'Середня швидкість за поїздку: пробіг / час.',
+  MAX_SPEED: 'Найбільша швидкість за поїздку.',
+  MAX_RPM: 'Найбільші оберти за поїздку.',
+  CLOCK: 'Годинник авто з CAN (0x080), годинники й хвилини.',
+  FUEL_L: 'Скільки пального спалено за поїздку. Рахується з лічильника форсунок (0x360); калібрування — меню FUEL CAL, поки НЕ відкалібровано.',
+  L100: 'Середня витрата за поїздку, л/100 км. На місці без пробігу покаже 0.',
+  LEFT_L: 'Оцінка пального в баку з датчика рівня (MS 0x499). Нуль шкали лише припущений, одна точка калібрування — число орієнтовне.',
+  LPH: 'Миттєва витрата, л/год. Корисна на місці й малих швидкостях.',
+  L100I: 'Миттєва витрата, л/100 км. Є лише від 10 км/год, фільтр ≈3 с.',
+  MAP: 'Абсолютний тиск у впускному колекторі, кПа. Холості ≈31, заглушений ≈99 (атмосфера), повний газ ближче до 100.',
+  IAT: 'Температура повітря на впуску. Спека під капотом її підіймає; понад 60 °C — жовтий. Запит до PCM.',
+  TIMING: 'Кут випередження запалювання, градуси до ВМТ. На холостих ≈4°, під навантаженням більше. Запит до PCM.',
+  STFT: 'Коротка корекція палива за лямбда-зондом, %. Близько 0 — норма, коливається ±5 %. Запит до PCM.',
+  LTFT: 'Довга (адаптивна) корекція палива, %. Показує, скільки ЕБУ звично додає/забирає пального. Понад ±10 % — привід шукати підсос повітря чи несправність. Зараз на авто ≈−14 %. Запит до PCM.',
+  TRIM: 'Сума STFT + LTFT — загальна корекція суміші, %. Запит до PCM.',
+  O2A: 'Напруга лямбда-зонда перед каталізатором (B1S1), В. Зонд вузькосмуговий: коливається 0,1–0,9 В навколо 0,45; це не значення лямбди. Запит до PCM.',
+  O2B: 'Напруга зонда після каталізатора (B1S2), В. Справний каталізатор дає майже рівне ≈0,6–0,7 В; якщо повторює верхній зонд — каталізатор поганий. Запит до PCM.',
+  LOAD: 'Розрахункове навантаження двигуна, %. На холостих 20–30 %, на повному газі до 100 %. Запит до PCM.',
+  ECT: 'Температура охолодної рідини так, як її бачить PCM (дубль COOL, але з OBD). Запит до PCM.',
+  THR: 'Положення дросельної заслінки, %. Закрита ≈0–5 %. Запит до PCM.',
+  FSYS: 'Стан паливної системи: CL — замкнений контур (корекція за лямбда-зондом, норма після прогріву), OL — розімкнений (холодний двигун або повний газ). Запит до PCM.',
+  DTC: 'Кількість збережених кодів несправностей. «n MIL» — ще й горить лампа Check Engine. Червоний, щойно є хоч один код. Запит до PCM.'
+};
 const PID = Object.fromEntries(META.map((m, i) => [m.id, i + 1]));   // P_NONE = 0
 const isObd = m => /\[OBD\]/.test(m.unit);
 const byIndex = i => META[i - 1];
@@ -415,13 +447,13 @@ function renderEditor() {
   sel.onchange = () => { s.items[selCell] = sel.value || null; while (s.items.length < 6) s.items.push(null); save(); renderAll(); };
   cp.append(el('label', {}, `клітинка ${selCell + 1}: `, sel));
   const id = s.items[selCell];
-  if (id) cp.append(el('span', { className: 'hint', textContent: byIndex(PID[id]).unit }));
+  if (id) cp.append(el('div', { className: 'hint', style: 'flex-basis:100%', textContent: byIndex(PID[id]).unit + ' — ' + DESC[id] }));
   const ul = $('msgs'); ul.replaceChildren();
   check().forEach(([k, t]) => ul.append(el('li', { className: k, textContent: t })));
 }
 function renderParams() {
   const t = $('params'); t.replaceChildren();
-  t.append(el('tr', {}, ...['параметр', 'підпис', 'warn ≤', 'warn ≥', 'alarm ≤', 'alarm ≥', 'демо', 'одиниця'].map(h => el('th', { textContent: h }))));
+  t.append(el('tr', {}, ...['параметр', 'підпис', 'warn ≤', 'warn ≥', 'alarm ≤', 'alarm ≥', 'демо', 'одиниця / що це'].map(h => el('th', { textContent: h }))));
   META.forEach(m => {
     const c = state.params[m.id];
     const label = el('input', { type: 'text', value: c[0], maxLength: 12 });
@@ -433,7 +465,7 @@ function renderParams() {
     t.append(el('tr', {},
       el('td', {}, el('span', { className: 'id', textContent: m.id }), used ? el('span', { className: 'badge', textContent: ` · на ${used} екр.` }) : '', isObd(m) ? el('span', { className: 'badgeobd', textContent: ' OBD' }) : ''),
       el('td', {}, label), el('td', {}, lim(1)), el('td', {}, lim(2)), el('td', {}, lim(3)), el('td', {}, lim(4)), el('td', {}, dm),
-      el('td', { className: 'hint', textContent: m.unit })));
+      el('td', { className: 'hint' }, el('div', { textContent: m.unit }), el('div', { className: 'desc', textContent: DESC[m.id] }))));
   });
 }
 function renderOut() { $('out').value = exportH(); }
