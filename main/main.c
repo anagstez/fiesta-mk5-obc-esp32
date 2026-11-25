@@ -84,6 +84,7 @@ static const char *TAG = "obc";
 #define SCR_DTC   (SCREEN_COUNT + 1) /* fault code list, entered by releasing the button after 3..5 s */
 #define DTC_MS    3000               /* hold this long (and release before MENU_MS): read the fault codes */
 #define NCYCLE    SCREEN_COUNT       /* screens in the turn cycle */
+#define BACK_MS   1000               /* hold this long (released before DTC_MS): back to DRIVE from any screen */
 #define LONG_MS   700                /* hold in the menu: back to DRIVE */
 #define MENU_MS   5000               /* hold: open the settings menu */
 
@@ -906,6 +907,28 @@ static void eco_step(uint32_t dt_ms)                 /* per frame: debounce the 
     if (g != cand) { cand = g; cand_ms = 0; }
     else if ((cand_ms += dt_ms) >= (g ? 300u : 700u)) eco_gear = g;
     eco_idle_ms = (car_live && car.speed < 2 && car.rpm > 500) ? eco_idle_ms + dt_ms : 0;
+}
+
+static bool screen_fixed(int s)                      /* DRIVE and ECO: switched by a click, skipped by the encoder turn */
+{
+    return s == 0 || (s > 0 && s < SCREEN_COUNT && SCREENS[s].kind == SK_ECO);
+}
+
+static int screen_eco(void)                          /* index of the ECO screen, -1 if screens.h has none */
+{
+    for (int i = 1; i < SCREEN_COUNT; i++) if (SCREENS[i].kind == SK_ECO) return i;
+    return -1;
+}
+
+static int screen_turn(int s, int steps)             /* encoder turn: through the other screens only (DRIVE/ECO are skipped) */
+{
+    const int d = steps > 0 ? 1 : -1;
+    for (int n = abs(steps); n > 0; n--)
+        for (int tries = 0; tries < NCYCLE; tries++) {
+            s = (s + d + NCYCLE) % NCYCLE;
+            if (!screen_fixed(s)) break;
+        }
+    return s;
 }
 
 static int eco_bin(int spd) { return clampi((spd - ECO_L_V0) / 10, 0, ECO_L_SPEEDS - 1); }
@@ -1875,7 +1898,7 @@ void app_main(void)
             if (screen == SCR_MENU) menu_rotate(steps);
             else if (screen == SCR_DTC) dtc_top = clampi(dtc_top + steps, 0, dtc_n > 5 ? dtc_n - 5 : 0);
             else if (btn_prev && cc_active) cruise_adjust(cc_step * steps);   /* held + turn: set speed */
-            else screen = ((screen + steps) % NCYCLE + NCYCLE) % NCYCLE;
+            else screen = screen_turn(screen, steps);
         }
 
         bool pressed = gpio_get_level(PIN_BTN) == 0 || gpio_get_level(PIN_ENC_SW) == 0;
@@ -1897,8 +1920,13 @@ void app_main(void)
             const uint32_t rel = pdTICKS_TO_MS(now - press_t);
             if (screen == SCR_MENU) menu_press();
             else if (rel >= DTC_MS) { dtc_start(); screen = SCR_DTC; }   /* released after 3..5 s: read the fault codes */
+            else if (rel >= BACK_MS) screen = SCR_DRIVE;                 /* held 1..3 s: back to DRIVE from anywhere */
             else if (screen == SCR_DTC) screen = SCR_DRIVE;              /* click: leave the list */
-            else cruise_toggle();                        /* click: nothing while ENABLE_CRUISE is 0 */
+            else if (screen_fixed(screen)) {             /* click: DRIVE <-> ECO */
+                const int e = screen_eco();
+                if (screen == SCR_DRIVE) { if (e > 0) screen = e; }
+                else screen = SCR_DRIVE;
+            } else cruise_toggle();                      /* click elsewhere: nothing while ENABLE_CRUISE is 0 */
         }
         btn_prev = pressed;
         if ((dtc_state == DTC_REQ || dtc_state == DTC_WAIT) && now - dtc_t_start > pdMS_TO_TICKS(4000)) dtc_state = DTC_FAIL;   /* HS-CAN missing or silent */
