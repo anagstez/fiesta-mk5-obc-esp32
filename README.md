@@ -1,10 +1,10 @@
 # Ford Fiesta MK5 — бортовий комп'ютер на ESP32-S3 + розбір CAN
 
 Прошивка ESP-IDF для ESP32-S3 і дисплея ST7789P3 2.25" 76×284 (ландшафт 284×76): бортовий ПК (trip computer) для Ford
-Fiesta MK5 (2008, 1.4 бензин), який **лише слухає** обидві CAN-шини авто й нічого не передає.
+Fiesta MK5 (2008, 1.4 бензин), який слухає обидві CAN-шини авто. На MS-CAN — лише слухає; на HS-CAN шле лише читальні OBD-запити (Mode 01/03). Окремий режим SERVICE (меню) перетворює плату на WiFi-адаптер ELM327 для FORScan і на цей час передає на шину.
 
 > **English:** an ESP-IDF firmware that turns a 76×284 ST7789 display into a trip computer for a 2008 Ford Fiesta MK5
-> by passively listening to its MS-CAN (125 kbit/s, on-chip TWAI) and HS-CAN (500 kbit/s, MCP2515). The main value of the
+> (read-only OBD requests on HS-CAN; an optional SERVICE mode exposes a WiFi ELM327 adapter for FORScan) by listening to its MS-CAN (125 kbit/s, on-chip TWAI) and HS-CAN (500 kbit/s, MCP2515). The main value of the
 > repo is [`docs/CAN-ANALYSIS.md`](docs/CAN-ANALYSIS.md): a documented reverse-engineering of the signals (rpm, speed,
 > gas, coolant, doors, lock, brake, injector pulse width and an injected-fuel counter) with the raw dumps in
 > [`dumps/`](dumps/) and the tools to reproduce it.
@@ -40,7 +40,7 @@ _Знімки графіків, списку DTC і ECO зроблено на п
 
 ## Можливості
 
-- **DRIVE:** шкала обертів, швидкість, температура, педаль газу, миттєва витрата (л/100 км або л/год), чипи L/R/HB/PB/DR/RV,
+- **DRIVE:** шкала обертів, швидкість, температура, педаль газу, миттєва витрата (л/100 км або л/год), чипи L/R/LT·HB/PB/DR/RV (один чип: `HB` — дальнє, `LT` — габарити/ближнє),
   попап дверей з іконками.
 - **TRIP:** пробіг, час, середня й макс. швидкість, макс. обороти, годинник авто (6 параметрів, 3×2).
 - **FUEL:** витрачено пального, середня витрата за поїздку, `LEFT L` — оцінка літрів у баку з `0x499` (нуль шкали припущено; 3 параметри, великим шрифтом).

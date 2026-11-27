@@ -108,7 +108,8 @@ typedef struct {
 /* status bits */
 #define ARROW_L   0x20
 #define ARROW_R   0x40
-#define LIGHT_HB  0x40               /* high beams */
+#define LIGHT_HB  0x40               /* high beams (0x286 d0; comes on top of LIGHT_SIDE) */
+#define LIGHT_SIDE 0x80              /* side/position lights, also on with the low beam (verified: dumps/lights-20261127-1734.log) */
 #define LIGHT_PB  0x10               /* handbrake */
 #define DOOR_FL    0x80              /* 0x433 byte 0 (roncapat: front left/driver, front right, trunk) */
 #define DOOR_FR    0x40
@@ -580,7 +581,8 @@ static void draw_drive(void)
         /* indicators, 3 x 2 chips (lit = coloured, dim = off) */
         draw_chip(200, 46, "L",  car.arrows & ARROW_L,  GREEN_ON, CHIP_FG);
         draw_chip(227, 46, "R",  car.arrows & ARROW_R,  GREEN_ON, CHIP_FG);
-        draw_chip(254, 46, "HB", car.lights & LIGHT_HB, ICE,      CHIP_FG);
+        if (car.lights & LIGHT_HB) draw_chip(254, 46, "HB", true, ICE, CHIP_FG);          /* one chip: HB over LT over off */
+        else                       draw_chip(254, 46, "LT", car.lights & LIGHT_SIDE, GREEN_ON, CHIP_FG);
         draw_chip(200, 60, "PB", car.lights & LIGHT_PB, RED,      WHITE);
         draw_chip(227, 60, "DR", car.doors & DOOR_ANY,  AMBER,    CHIP_FG);
         draw_chip(254, 60, "RV", car.reverse,           WHITE,    CHIP_FG);
