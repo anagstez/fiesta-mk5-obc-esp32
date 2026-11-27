@@ -31,6 +31,7 @@
 #include "screens.h"
 #include "dtc_desc.h"
 #include "eco.h"
+#include "service.h"
 
 #define ICON_W 76
 #define ICON_H 52
@@ -82,6 +83,7 @@ static const char *TAG = "obc";
 #define GSER      3                  /* parameters per SK_GRAPH screen */
 #define SCR_MENU  SCREEN_COUNT       /* after the configured screens, entered by a 5 s hold */
 #define SCR_DTC   (SCREEN_COUNT + 1) /* fault code list, entered by releasing the button after 3..5 s */
+#define SCR_SERVICE (SCREEN_COUNT + 2) /* SERVICE mode: WiFi ELM327 for FORScan, entered from the menu */
 #define DTC_MS    3000               /* hold this long (and release before MENU_MS): read the fault codes */
 #define NCYCLE    SCREEN_COUNT       /* screens in the turn cycle */
 #define BACK_MS   1000               /* hold this long (released before DTC_MS): back to DRIVE from any screen */
@@ -142,6 +144,17 @@ static int fuel_ul = 100;
 static uint32_t fuel_last, trip_fuel, tank_cnt, tank_saved;
 static struct { uint32_t steps, m; } eco_map[ECO_GEARS][ECO_L_SPEEDS];   /* learned consumption, see eco.h */
 static bool eco_map_dirty;
+
+/* SERVICE mode (FORScan over WiFi): while svc_on the board forwards frames between one bus and the ELM327 emulator */
+typedef struct { uint16_t id; uint8_t dlc; uint8_t bus; uint8_t d[8]; } svc_frame_t;   /* bus: where a received frame came from */
+static QueueHandle_t svc_rxq, svc_txq;       /* frames from the bus to the emulator / from the emulator to the HS-CAN task */
+static volatile bool svc_on, hs_ok;
+static volatile int svc_bus;                 /* 0 = HS-CAN (MCP2515, 500k), 1 = MS-CAN (TWAI, 125k), 2 = AUTO: both, a module is found by its answer */
+static uint8_t svc_route[0x800];             /* AUTO: per request ID, 1 + the bus its module answered on (0 = unknown, ask both) */
+static volatile uint32_t svc_fid, svc_fmask; /* a received frame is queued when (id & svc_fmask) == svc_fid */
+static bool svc_enter(void);
+static void draw_service(void);
+static void svc_exit(void);
 
 /* ECO thresholds that the menu "ECO SET" edits; defaults are the #defines in eco.h, saved in NVS under `key` */
 static int eco_up = ECO_RPM_UP, eco_up_lt = ECO_RPM_UP_LIGHT, eco_low = ECO_RPM_LOW, eco_heavy = ECO_GAS_HEAVY;
@@ -1148,13 +1161,14 @@ static void render(void)
     }
 
     if (screen == SCR_DTC)                        draw_dtc();
+    else if (screen == SCR_SERVICE)               draw_service();
     else if (screen >= SCREEN_COUNT)              draw_menu();
     else if (SCREENS[screen].kind == SK_GRID)     draw_grid(&SCREENS[screen]);
     else if (SCREENS[screen].kind == SK_GRAPH)    draw_graph(screen);
     else if (SCREENS[screen].kind == SK_ECO)      draw_eco();
     else                                          draw_drive();
 
-    if (screen != SCR_MENU && screen != SCR_DTC && btn_held_ms >= DTC_MS) {   /* what releasing now does */
+    if (screen != SCR_MENU && screen != SCR_DTC && screen != SCR_SERVICE && btn_held_ms >= DTC_MS) {   /* what releasing now does */
         const char *hint = btn_held_ms >= MENU_MS ? "MENU" : "RELEASE: FAULT CODES";
         const int w = text_w(hint, 1) + 8, x = (LCD_W - w) / 2;
         fill_rect(x, LCD_H / 2 - 8, w, 16, DIM);
@@ -1261,7 +1275,7 @@ static void IRAM_ATTR dump_push_isr(char bus, uint32_t id, const uint8_t *d, int
 }
 
 /* settings menu: turn = move (or change the value in edit mode), press = select/confirm, hold = back to DRIVE */
-enum { MI_BRIGHT, MI_AUTOLOCK, MI_GRAPH_PARAM, MI_GRAPH_SPAN, MI_FUEL_CAL, MI_TANK, MI_TRIP_RESET, MI_ECO_SET, MI_ECO_RESET, MI_DUMP, MI_EXIT, NMENU };
+enum { MI_BRIGHT, MI_AUTOLOCK, MI_GRAPH_PARAM, MI_GRAPH_SPAN, MI_FUEL_CAL, MI_TANK, MI_TRIP_RESET, MI_ECO_SET, MI_ECO_RESET, MI_SERVICE, MI_DUMP, MI_EXIT, NMENU };
 #define MENU_ROWS 4
 static int menu_sel, menu_top;
 static bool menu_edit;
@@ -1345,6 +1359,9 @@ static void menu_press(void)
         eco_map_save();
         ESP_LOGI(TAG, "eco map reset");
         break;
+    case MI_SERVICE:
+        if (svc_enter()) { menu_edit = false; screen = SCR_SERVICE; }
+        break;
     case MI_DUMP:
         dump_on = !dump_on;
         break;
@@ -1354,9 +1371,25 @@ static void menu_press(void)
     }
 }
 
+static void draw_service(void)
+{
+    draw_text(6, 3, 2, WHITE, "SERVICE");
+    const char *bus = svc_bus == 0 ? "HS-CAN" : svc_bus == 1 ? "MS-CAN" : "AUTO";
+    draw_text(LCD_W - 8 - text_w(bus, 2), 3, 2, AMBER, bus);
+    draw_text(6, 20, 2, WHITE, service_ssid());
+    char b[32];
+    snprintf(b, sizeof(b), "PASS %s", service_pass());
+    draw_text(6, 36, 2, WHITE, b);
+    draw_text(6, 54, 1, GRAY, "192.168.0.10:35000");
+    const bool cl = service_client();
+    const char *st = svc_bus == 0 && !hs_ok ? "NO HS MODULE" : cl ? "FORSCAN CONNECTED" : "WAITING";
+    draw_text(LCD_W - 8 - text_w(st, 1), 54, 1, cl ? GREEN_ON : AMBER, st);
+    draw_text(6, 66, 1, GRAY, cl ? "HOLD: EXIT" : "TURN: BUS   HOLD: EXIT");
+}
+
 static void draw_menu(void)
 {
-    static const char *const label[NMENU] = { "BRIGHT", "AUTO LOCK", "GR PARAM", "GR SPAN", "FUEL CAL", "TANK L", "TRIP RESET", "ECO SET", "ECO RESET", "CAN DUMP", "EXIT" };
+    static const char *const label[NMENU] = { "BRIGHT", "AUTO LOCK", "GR PARAM", "GR SPAN", "FUEL CAL", "TANK L", "TRIP RESET", "ECO SET", "ECO RESET", "SERVICE", "CAN DUMP", "EXIT" };
     char v[24];
     const int nrows = menu_n();
     for (int r = 0; r < MENU_ROWS; r++) {
@@ -1458,6 +1491,7 @@ static void hs_task(void *arg)
         ESP_LOGW(TAG, "MCP2515 init failed, HS-CAN disabled");
         vTaskDelete(NULL);
     }
+    hs_ok = true;
     uint32_t frames = 0, last_log = 0;
     mcp_frame_t f;
     /* OBD-II Mode 01 read-only polling (functional request 0x7DF, PCM answers 0x7E8), non-stop while CAN is alive:
@@ -1473,9 +1507,13 @@ static void hs_task(void *arg)
     int unanswered = 0;
     uint32_t n_sent = 0, n_ans = 0, n_busy = 0;
     while (1) {
-        xSemaphoreTake(mcp2515_rx_sem(), pdMS_TO_TICKS(50));
+        xSemaphoreTake(mcp2515_rx_sem(), pdMS_TO_TICKS(svc_on ? 2 : 50));
         const TickType_t tn = xTaskGetTickCount();
-        if (dtc_state == DTC_REQ) {                      /* one read-only request: service 03, stored codes */
+        svc_frame_t sx;
+        while (svc_on && svc_bus != 1 && xQueueReceive(svc_txq, &sx, 0) == pdTRUE) {     /* SERVICE: frames from FORScan */
+            for (int i = 0; i < 20 && !mcp2515_send(sx.id, sx.d, sx.dlc); i++) vTaskDelay(1);
+        }
+        if (dtc_state == DTC_REQ && !svc_on) {           /* one read-only request: service 03, stored codes */
             const uint8_t rq[8] = { 0x02, 0x03, 0, 0, 0, 0, 0, 0 };
             tp_len = tp_got = 0;
             if (mcp2515_send(0x7DF, rq, 8)) { dtc_state = DTC_WAIT; dtc_t0 = tn; ESP_LOGI(TAG, "DTC: Mode 03 requested"); }
@@ -1484,7 +1522,7 @@ static void hs_task(void *arg)
             ESP_LOGW(TAG, "DTC: no answer");
         }
         const uint16_t shown = screen_pid_mask(screen);
-        if (all && car_live && dtc_state != DTC_REQ && dtc_state != DTC_WAIT && (int32_t)(tn - next_req) >= 0) {
+        if (all && car_live && !svc_on && dtc_state != DTC_REQ && dtc_state != DTC_WAIT && (int32_t)(tn - next_req) >= 0) {
             const uint16_t mask = (turn_shown && shown) ? shown : all;
             size_t *idx = (turn_shown && shown) ? &pid_i : &bg_i;
             for (int t = 0; t < NQ && !(mask >> *idx & 1); t++) *idx = (*idx + 1) % NQ;
@@ -1502,6 +1540,10 @@ static void hs_task(void *arg)
         }
         while (mcp2515_read(&f)) {
             frames++;
+            if (svc_on && svc_bus != 1 && !f.ext && !f.rtr && (f.id & svc_fmask) == svc_fid) {
+                const svc_frame_t sf = { .id = f.id, .dlc = f.dlc, .bus = 0, .d = { f.data[0], f.data[1], f.data[2], f.data[3], f.data[4], f.data[5], f.data[6], f.data[7] } };
+                xQueueSend(svc_rxq, &sf, 0);
+            }
             if (f.id == 0x7E8 && !f.ext && !f.rtr && f.dlc >= 4 && f.data[1] == 0x41) {
                 const int a = f.data[3];
                 int q = 0;
@@ -1592,13 +1634,20 @@ static bool IRAM_ATTR on_can_rx(twai_node_handle_t node, const twai_rx_done_even
         int len = f.header.dlc > 8 ? 8 : f.header.dlc;
         can_decode(f.header.id, d, len);
         if (len) dump_push_isr('M', f.header.id, d, len);
+        BaseType_t svc_woken = pdFALSE;
+        if (svc_on && svc_bus != 0 && len && (f.header.id & svc_fmask) == svc_fid) {
+            svc_frame_t sf = { .id = f.header.id, .dlc = len, .bus = 1 };
+            memcpy(sf.d, d, len);
+            xQueueSendFromISR(svc_rxq, &sf, &svc_woken);
+        }
         if (f.header.id == GEM_RX_ID && gem_q && len == 8) {
             gem_frame_t g;
             memcpy(g.d, d, 8);
             BaseType_t woken = pdFALSE;
             xQueueSendFromISR(gem_q, &g, &woken);
-            return woken == pdTRUE;
+            return woken == pdTRUE || svc_woken == pdTRUE;
         }
+        return svc_woken == pdTRUE;
     }
     return false;
 }
@@ -1626,6 +1675,99 @@ static bool can_open(bool listen_only)
 static void can_init(void)
 {
     can_open(true);
+}
+
+/* ---- SERVICE mode glue: the ELM327 emulator (elm.c) reaches the buses through these ---- */
+static bool svc_send_hs(uint32_t id, const uint8_t *d, uint8_t dlc)
+{
+    svc_frame_t f = { .id = id, .dlc = dlc };
+    memcpy(f.d, d, dlc);
+    return xQueueSend(svc_txq, &f, pdMS_TO_TICKS(20)) == pdTRUE;
+}
+
+static bool svc_send_ms(uint32_t id, const uint8_t *d, uint8_t dlc)
+{
+    uint8_t b[8];
+    memcpy(b, d, dlc);
+    twai_frame_t f = { .header = { .id = id, .dlc = dlc }, .buffer = b, .buffer_len = dlc };
+    return twai_node_transmit(ms_node, &f, 50) == ESP_OK && twai_node_transmit_wait_all_done(ms_node, 100) == ESP_OK;
+}
+
+static bool svc_io_send(uint32_t id, const uint8_t *d, uint8_t dlc)
+{
+    int bus = svc_bus;
+    if (bus == 2 && id < 0x800 && svc_route[id]) bus = svc_route[id] - 1;   /* module already found: that bus only */
+    if (bus == 0) return svc_send_hs(id, d, dlc);
+    if (bus == 1) return svc_send_ms(id, d, dlc);
+    const bool a = svc_send_hs(id, d, dlc);                                  /* unknown module: ask on both buses */
+    const bool b = svc_send_ms(id, d, dlc);
+    return a || b;
+}
+
+static bool svc_io_recv(uint32_t *id, uint8_t *d, uint8_t *dlc, uint32_t wait_ms)
+{
+    svc_frame_t f;
+    if (xQueueReceive(svc_rxq, &f, pdMS_TO_TICKS(wait_ms)) != pdTRUE) return false;
+    *id = f.id;
+    *dlc = f.dlc;
+    memcpy(d, f.d, 8);
+    if (svc_bus == 2 && f.id >= 0x708 && f.id < 0x800) svc_route[f.id - 8] = 1 + f.bus;   /* an answer ID+8 tells which bus the module is on */
+    return true;
+}
+
+static void svc_io_filter(uint32_t id, uint32_t mask)
+{
+    svc_fmask = mask;
+    svc_fid = id & mask;
+}
+
+static void svc_io_flush(void) { xQueueReset(svc_rxq); }
+static int svc_io_volt(void) { return car_live ? car.volt10 : 0; }
+
+static const elm_io_t SVC_IO = { svc_io_send, svc_io_recv, svc_io_filter, svc_io_flush, svc_io_volt };
+
+static void svc_bus_open(int bus)
+{
+    svc_bus = bus;
+    memset(svc_route, 0, sizeof(svc_route));
+    xQueueReset(svc_rxq);
+    xQueueReset(svc_txq);
+    if (bus != 0) {                                      /* MS-CAN transmits and ACKs only while the service runs */
+        twai_node_disable(ms_node);
+        twai_node_delete(ms_node);
+        can_open(false);
+    }
+    svc_on = true;
+}
+
+static void svc_bus_close(void)
+{
+    svc_on = false;
+    if (svc_bus != 0) {
+        twai_node_disable(ms_node);
+        twai_node_delete(ms_node);
+        can_open(true);
+    }
+}
+
+static bool svc_enter(void)
+{
+    if (svc_on) return true;
+    if (car_live && car.speed != 0) { ESP_LOGW(TAG, "SERVICE refused: the car must stand still"); return false; }
+    if (!svc_rxq) { svc_rxq = xQueueCreate(64, sizeof(svc_frame_t)); svc_txq = xQueueCreate(16, sizeof(svc_frame_t)); }
+    svc_io_filter(0x7E8, 0x7F8);
+    if (!service_start(&SVC_IO)) return false;
+    ESP_LOGW(TAG, "SERVICE: WiFi %s / %s, the board now TRANSMITS on the bus for FORScan", service_ssid(), service_pass());
+    svc_bus_open(hs_ok ? 2 : 1);
+    return true;
+}
+
+static void svc_exit(void)
+{
+    if (!svc_on) return;
+    service_stop();
+    svc_bus_close();
+    ESP_LOGW(TAG, "SERVICE ended, buses back to normal");
 }
 
 /* GEM As-Built READ ONLY (ISO 15765-2 / KWP2000, protocol notes in docs/): 10 87, then 21 01/02/03 on 0x726.
@@ -1868,14 +2010,14 @@ void app_main(void)
             char c = (char)rx[i];
             if (c == '\n') {
                 line[n] = 0;
-                if (line[0] == 'N' && screen != SCR_MENU && screen != SCR_DTC) screen = (screen + 1) % NCYCLE;
+                if (line[0] == 'N' && screen != SCR_MENU && screen != SCR_DTC && screen != SCR_SERVICE) screen = (screen + 1) % NCYCLE;
                 else if (line[0] == 'P' && ENABLE_CRUISE) { ui_preview = (ui_preview + 1) % 4; ui_preview_tick = now; }
                 else if (line[0] == 'F') fb_dump = true;
                 else if (line[0] == 'O') ui_doors = (ui_doors + 1) % 6;
                 else if (line[0] == 'S') cruise_toggle();
                 else if (line[0] == '+') cruise_adjust(cc_step);
                 else if (line[0] == '-') cruise_adjust(-cc_step);
-                else if ((line[0] == 'G' || line[0] == 'W' || line[0] == 'E') && !gem_busy) { gem_busy = true; xTaskCreate(gem_task, "gem", 5120, (void *)(intptr_t)(line[0] == 'W' ? 1 : line[0] == 'E' ? 2 : 0), 4, NULL); }
+                else if ((line[0] == 'G' || line[0] == 'W' || line[0] == 'E') && !gem_busy && !svc_on) { gem_busy = true; xTaskCreate(gem_task, "gem", 5120, (void *)(intptr_t)(line[0] == 'W' ? 1 : line[0] == 'E' ? 2 : 0), 4, NULL); }
                 else if (line[0] == 'L') {
                     for (int g = 0; g < ECO_GEARS; g++)
                         for (int b = 0; b < ECO_L_SPEEDS; b++)
@@ -1896,6 +2038,9 @@ void app_main(void)
             enc_acc -= steps * ENC_TRANS;
             if (btn_prev) long_done = true;              /* turned while held: not a click, not a 5 s hold */
             if (screen == SCR_MENU) menu_rotate(steps);
+            else if (screen == SCR_SERVICE) {                              /* turn: HS-CAN <-> MS-CAN, only while nobody is connected */
+                if (svc_on && !service_client() && hs_ok) { const int nb = svc_bus == 2 ? 0 : svc_bus == 0 ? 1 : 2; svc_bus_close(); svc_bus_open(nb); }
+            }
             else if (screen == SCR_DTC) dtc_top = clampi(dtc_top + steps, 0, dtc_n > 5 ? dtc_n - 5 : 0);
             else if (btn_prev && cc_active) cruise_adjust(cc_step * steps);   /* held + turn: set speed */
             else screen = screen_turn(screen, steps);
@@ -1909,7 +2054,7 @@ void app_main(void)
             if (screen == SCR_MENU && held >= LONG_MS) {
                 long_done = true;                        /* hold in the menu: back to DRIVE */
                 menu_leave();
-            } else if (screen != SCR_MENU && held >= MENU_MS) {
+            } else if (screen != SCR_MENU && screen != SCR_SERVICE && held >= MENU_MS) {
                 long_done = true;                        /* 5 s hold: open the settings menu */
                 menu_sel = 0;
                 menu_edit = false;
@@ -1919,6 +2064,7 @@ void app_main(void)
         if (!pressed && btn_prev && !long_done) {
             const uint32_t rel = pdTICKS_TO_MS(now - press_t);
             if (screen == SCR_MENU) menu_press();
+            else if (screen == SCR_SERVICE) { if (rel >= BACK_MS) screen = SCR_DRIVE; }   /* leaving the screen ends the service */
             else if (rel >= DTC_MS) { dtc_start(); screen = SCR_DTC; }   /* released after 3..5 s: read the fault codes */
             else if (rel >= BACK_MS) screen = SCR_DRIVE;                 /* held 1..3 s: back to DRIVE from anywhere */
             else if (screen == SCR_DTC) screen = SCR_DRIVE;              /* click: leave the list */
@@ -1932,6 +2078,12 @@ void app_main(void)
         if ((dtc_state == DTC_REQ || dtc_state == DTC_WAIT) && now - dtc_t_start > pdMS_TO_TICKS(4000)) dtc_state = DTC_FAIL;   /* HS-CAN missing or silent */
 
         car_live = can_seen && (now - last_can) < pdMS_TO_TICKS(STALE_MS);
+        if (svc_on) {
+            static TickType_t moving_since;
+            if (car_live && car.speed >= 5) { if (!moving_since) moving_since = now; if (now - moving_since > pdMS_TO_TICKS(2000)) screen = SCR_DRIVE; }
+            else moving_since = 0;
+            if (screen != SCR_SERVICE) svc_exit();
+        }
 
         uint32_t dt = pdTICKS_TO_MS(now - last_frame);
         if (dt >= FRAME_MS) {

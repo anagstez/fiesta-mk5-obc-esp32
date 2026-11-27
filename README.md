@@ -102,3 +102,7 @@ idf.py -p <порт> flash
 ## Ліцензія
 
 MIT, див. [`LICENSE`](LICENSE).
+
+## SERVICE mode (FORScan over WiFi)
+
+Menu `SERVICE` starts WiFi AP `OBC-SERVICE` (password shown on the display), ELM327 emulation on `192.168.0.10:35000`. Bus: AUTO (both, module found by its answer), HS-CAN or MS-CAN (encoder). The board transmits on the bus while the mode runs; only with the car stationary. Not yet verified with FORScan on a car.
