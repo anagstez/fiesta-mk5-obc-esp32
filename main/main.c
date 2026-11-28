@@ -1692,7 +1692,14 @@ static bool svc_send_ms(uint32_t id, const uint8_t *d, uint8_t dlc)
     uint8_t b[8];
     memcpy(b, d, dlc);
     twai_frame_t f = { .header = { .id = id, .dlc = dlc }, .buffer = b, .buffer_len = dlc };
-    return twai_node_transmit(ms_node, &f, 50) == ESP_OK && twai_node_transmit_wait_all_done(ms_node, 100) == ESP_OK;
+    const esp_err_t e1 = twai_node_transmit(ms_node, &f, 50);
+    const esp_err_t e2 = e1 == ESP_OK ? twai_node_transmit_wait_all_done(ms_node, 100) : e1;
+    twai_node_status_t st = { 0 };
+    twai_node_record_t rec = { 0 };
+    twai_node_get_info(ms_node, &st, &rec);
+    ESP_LOGI(TAG, "MS tx %03X: queue %s, done %s; state %d tec %d rec %d, bus errors %lu", (unsigned)id, esp_err_to_name(e1), esp_err_to_name(e2),
+             (int)st.state, (int)st.tx_error_count, (int)st.rx_error_count, (unsigned long)rec.bus_err_num);
+    return e2 == ESP_OK;
 }
 
 static bool svc_io_send(uint32_t id, const uint8_t *d, uint8_t dlc)
@@ -2020,6 +2027,17 @@ void app_main(void)
                 else if (line[0] == '+') cruise_adjust(cc_step);
                 else if (line[0] == '-') cruise_adjust(-cc_step);
                 else if ((line[0] == 'G' || line[0] == 'W' || line[0] == 'E') && !gem_busy && !svc_on) { gem_busy = true; xTaskCreate(gem_task, "gem", 5120, (void *)(intptr_t)(line[0] == 'W' ? 1 : line[0] == 'E' ? 2 : 0), 4, NULL); }
+                else if (line[0] == 'X' && svc_on) {              /* test in SERVICE: read-only DTC request 18 00 FF 00 to the usual modules, answers show in the 'D' dump */
+                    static const uint16_t ids[] = { 0x726, 0x727, 0x760, 0x730, 0x737, 0x720 };
+                    const uint8_t rq[8] = { 0x04, 0x18, 0x00, 0xFF, 0x00, 0, 0, 0 };
+                    svc_io_filter(0x700, 0x700);
+                    for (int i = 0; i < 6; i++) {
+                        ESP_LOGI(TAG, "X: request to %03X on both buses", ids[i]);
+                        svc_send_hs(ids[i], rq, 8);
+                        svc_send_ms(ids[i], rq, 8);
+                        vTaskDelay(pdMS_TO_TICKS(400));
+                    }
+                }
                 else if (line[0] == 'L') {
                     for (int g = 0; g < ECO_GEARS; g++)
                         for (int b = 0; b < ECO_L_SPEEDS; b++)

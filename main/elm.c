@@ -32,6 +32,7 @@ typedef struct {
     int fcsh, fcsm, fcsd_n;          /* ATFCSH (-1 = default), ATFCSM, ATFCSD length */
     uint8_t fcsd[5];
     uint32_t st_ms;
+    int want;                        /* trailing digit of a request: how many answers to wait for (0 = until the timeout) */
     uint8_t pad;
     char last[2 * REQ_MAX + 4];
     bool asm_on;                     /* ISO-TP answer in progress */
@@ -271,6 +272,7 @@ static int collect(elm_t *e)
         if (pending) {
             deadline = xTaskGetTickCount() + pdMS_TO_TICKS(PENDING_MS);
         } else if (complete) {
+            if (e->want && printed >= e->want) break;
             const TickType_t q = xTaskGetTickCount() + pdMS_TO_TICKS(e->st_ms < QUIET_MS ? e->st_ms : QUIET_MS);
             if ((int32_t)(q - deadline) < 0) deadline = q;
             else if (printed == 1) deadline = q;
@@ -285,8 +287,8 @@ static void transact(elm_t *e, const uint8_t *req, int n)
     bool ok;
     if (!e->caf) ok = n <= 8 && send_retry(e, e->tx_id, req, n);
     else ok = isotp_send(e, req, n);
-    if (!ok) { reply(e, n > 8 && !e->caf ? "?" : "CAN ERROR"); return; }
-    if (!collect(e)) reply(e, "NO DATA");
+    if (!ok) { ESP_LOGI(TAG, "  CAN ERROR on send"); reply(e, n > 8 && !e->caf ? "?" : "CAN ERROR"); return; }
+    if (!collect(e)) { ESP_LOGI(TAG, "  NO DATA (id %03X, filter %03X/%03X)", (unsigned)e->tx_id, (unsigned)e->cf, (unsigned)e->cm); reply(e, "NO DATA"); }
 }
 
 /* ---- commands ---- */
@@ -404,6 +406,10 @@ static void at_cmd(elm_t *e, const char *c)
         reply(e, "OK");
     } else if (PFX("ST")) {
         if (parse_hex(c + 2, &v)) { e->st_ms = v ? v * 4 : 4; reply(e, "OK"); } else reply(e, "?");
+    } else if (IS("AR")) {                           /* automatic receive: the answer address follows ATSH again */
+        e->cra = -1; e->use_cf = false;
+        apply_filter(e);
+        reply(e, "OK");
     } else if (IS("MA")) monitor(e);
     else reply(e, "OK");                             /* AL, NL, AT0..2, M0/1, R0/1, D0/1, SS, IB.., PP.., BRD ...: accepted, no effect */
 #undef IS
@@ -418,10 +424,16 @@ static void handle(elm_t *e, char *line)
     } else {
         snprintf(e->last, sizeof(e->last), "%s", line);
     }
+    ESP_LOGI(TAG, "> %s", line);
     if (line[0] == 'A' && line[1] == 'T') {
         at_cmd(e, line + 2);
     } else {
-        const int len = (int)strlen(line);
+        int len = (int)strlen(line);
+        e->want = 0;
+        if ((len & 1) && len >= 3 && hexv(line[len - 1]) >= 0) {      /* ELM327 v1.3+: "0100" + "1" */
+            e->want = hexv(line[len - 1]);
+            line[--len] = 0;
+        }
         bool ok = len >= 2 && !(len & 1);
         for (int i = 0; i < len && ok; i++) ok = hexv(line[i]) >= 0;
         if (!ok) {

@@ -20,6 +20,12 @@ static char pass[9];
 static volatile bool stopping, running, connected;
 static const elm_io_t *svc_io;
 
+static void wifi_ev(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (id == WIFI_EVENT_AP_STACONNECTED) ESP_LOGI(TAG, "WiFi station joined");
+    else if (id == WIFI_EVENT_AP_STADISCONNECTED) ESP_LOGI(TAG, "WiFi station left");
+}
+
 static bool wifi_up(void)
 {
     if (!wifi_ready) {
@@ -30,6 +36,7 @@ static bool wifi_up(void)
         if (esp_wifi_init(&ic) != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_init failed"); return false; }
         esp_wifi_set_storage(WIFI_STORAGE_RAM);
         wifi_ready = true;
+        esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_ev, NULL);
     }
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
